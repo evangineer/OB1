@@ -8,6 +8,7 @@ MCP server extensions, webhook receivers, and capture sources beyond your AI too
 | ----------- | ------------ |
 | [Slack Capture](slack-capture/) | Type thoughts in a Slack channel, automatically embedded and stored |
 | [Discord Capture](discord-capture/) | Capture thoughts from a Discord server |
+| [Matrix Capture](matrix-capture/) | Self-hosted Matrix room capture via `matrix-js-sdk` |
 
 ## Contributing
 

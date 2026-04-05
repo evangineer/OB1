@@ -1,0 +1,15 @@
+services:
+  matrix-capture:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: matrix-capture
+    restart: unless-stopped
+    env_file:
+      - .env.matrix-capture
+    volumes:
+      - matrix_capture_data:/data
+    init: true
+
+volumes:
+  matrix_capture_data:

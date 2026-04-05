@@ -128,6 +128,7 @@ MCP server extensions, alternative deployment targets, and capture sources beyon
 | [Kubernetes Deployment](integrations/kubernetes-deployment/) | Fully self-hosted K8s deployment with PostgreSQL + pgvector — no Supabase required | [@velo](https://github.com/velo) |
 | [Slack Capture](integrations/slack-capture/) | Quick-capture thoughts via Slack messages with auto-embedding and classification | Core |
 | [Discord Capture](integrations/discord-capture/) | Discord bot that captures messages into Open Brain, mirroring the Slack pattern | Core |
+| [Matrix Capture](integrations/matrix-capture/) | Self-hosted Matrix room capture via `matrix-js-sdk`, designed for your own homeserver | Community |
 
 ### [`/primitives`](primitives/) — Reusable Patterns
 

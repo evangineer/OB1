@@ -1,0 +1,15 @@
+{
+  "name": "matrix-capture",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "tsx service.ts"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.47.10",
+    "indexeddbshim": "^15.2.0",
+    "matrix-js-sdk": "^36.2.0",
+    "tsx": "^4.20.6"
+  }
+}

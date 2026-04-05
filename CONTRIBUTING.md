@@ -29,7 +29,7 @@ This is a first-class path, not a workaround. Some of the best contributions com
 | `recipes/` | Step-by-step builds that add a new capability | Email import, ChatGPT import, daily digest, new capture workflows | Open |
 | `schemas/` | Database table extensions and metadata schemas | CRM contacts table, taste tracker, reading list schema | Open |
 | `dashboards/` | Frontend templates for Vercel/Netlify hosting | Knowledge dashboard, weekly review, mobile capture UI | Open |
-| `integrations/` | MCP extensions, webhooks, capture sources | Discord bot, email handler, browser extension, calendar sync | Open |
+| `integrations/` | MCP extensions, webhooks, capture sources | Discord bot, Matrix bot, browser extension, calendar sync | Open |
 | `skills/` | Reusable AI client skills and prompt packs | Meeting triage assistant, code review protocol, transcript processor | Open |
 
 ### Extensions vs Primitives vs Recipes vs Skills

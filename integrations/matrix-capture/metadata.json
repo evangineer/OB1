@@ -1,0 +1,19 @@
+{
+  "name": "Matrix Capture",
+  "description": "Self-hosted Matrix room capture for Open Brain with matrix-js-sdk, including an E2EE-capable long-running service path.",
+  "category": "integrations",
+  "author": {
+    "name": "Community Contributor"
+  },
+  "version": "1.0.0",
+  "requires": {
+    "open_brain": true,
+    "services": ["Matrix homeserver", "OpenRouter"],
+    "tools": ["Node.js 20+"]
+  },
+  "tags": ["matrix", "capture", "self-hosted", "homeserver", "messaging"],
+  "difficulty": "intermediate",
+  "estimated_time": "45 minutes",
+  "created": "2026-04-05",
+  "updated": "2026-04-05"
+}
