@@ -6,7 +6,7 @@ Database table extensions and metadata schemas for your Supabase database. Drop 
 
 | Schema | What It Does |
 | ------ | ------------ |
-| *(none yet — contributions welcome!)* | |
+| [open-brain.sql](./open-brain.sql) | Canonical bootstrap for the core Open Brain `thoughts` table, indexes, RLS policy, and helper functions (`match_thoughts`, `upsert_thought`) |
 
 > **Looking for CRM?** See [`extensions/professional-crm`](../extensions/professional-crm/) — it includes schema + a full MCP server.
 

@@ -49,181 +49,32 @@ Supabase is your database. It stores your thoughts as raw text, vector embedding
 
 ![Step 2](https://img.shields.io/badge/Step_2-Set_Up_the_Database-F4511E?style=for-the-badge)
 
-Four SQL commands, pasted one at a time. This creates your storage table, your search function, your security policy, and the permissions your server needs to read and write data.
+Run the canonical SQL bootstrap from [`schemas/open-brain.sql`](../schemas/open-brain.sql).
+That file is the source of truth for the core Open Brain schema. If the docs and
+the SQL file ever disagree, trust the SQL file.
 
 ![2.1](https://img.shields.io/badge/2.1-Enable_the_Vector_Extension-555?style=for-the-badge&labelColor=F4511E)
 
 In the left sidebar: **Database → Extensions** → search for "vector" → flip **pgvector ON**.
 
-![2.2](https://img.shields.io/badge/2.2-Create_the_Thoughts_Table-555?style=for-the-badge&labelColor=F4511E)
+![2.2](https://img.shields.io/badge/2.2-Run_the_Bootstrap_SQL-555?style=for-the-badge&labelColor=F4511E)
 
-In the left sidebar: **SQL Editor → New query** → paste and Run:
+In the left sidebar: **SQL Editor → New query**.
 
-<details>
-<summary>📋 <strong>SQL: Thoughts table + indexes</strong> (click to expand)</summary>
-
-```sql
--- Create the thoughts table
-create table thoughts (
-  id uuid default gen_random_uuid() primary key,
-  content text not null,
-  embedding vector(1536),
-  metadata jsonb default '{}'::jsonb,
-  created_at timestamptz default now(),
-  updated_at timestamptz default now()
-);
-
--- Index for fast vector similarity search
-create index on thoughts
-  using hnsw (embedding vector_cosine_ops);
-
--- Index for filtering by metadata fields
-create index on thoughts using gin (metadata);
-
--- Index for date range queries
-create index on thoughts (created_at desc);
-
--- Auto-update the updated_at timestamp
-create or replace function update_updated_at()
-returns trigger as $$
-begin
-  new.updated_at = now();
-  return new;
-end;
-$$ language plpgsql;
-
-create trigger thoughts_updated_at
-  before update on thoughts
-  for each row
-  execute function update_updated_at();
-```
-
-</details>
-
-![2.3](https://img.shields.io/badge/2.3-Create_the_Search_Function-555?style=for-the-badge&labelColor=F4511E)
-
-New query → paste and Run:
-
-<details>
-<summary>📋 <strong>SQL: Semantic search function</strong> (click to expand)</summary>
-
-```sql
-create or replace function match_thoughts(
-  query_embedding vector(1536),
-  match_threshold float default 0.7,
-  match_count int default 10,
-  filter jsonb default '{}'::jsonb
-)
-returns table (
-  id uuid,
-  content text,
-  metadata jsonb,
-  similarity float,
-  created_at timestamptz
-)
-language plpgsql
-as $$
-begin
-  return query
-  select
-    t.id,
-    t.content,
-    t.metadata,
-    1 - (t.embedding <=> query_embedding) as similarity,
-    t.created_at
-  from thoughts t
-  where 1 - (t.embedding <=> query_embedding) > match_threshold
-    and (filter = '{}'::jsonb or t.metadata @> filter)
-  order by t.embedding <=> query_embedding
-  limit match_count;
-end;
-$$;
-```
-
-</details>
-
-![2.4](https://img.shields.io/badge/2.4-Lock_Down_Security-555?style=for-the-badge&labelColor=F4511E)
-
-One more new query:
-
-<details>
-<summary>📋 <strong>SQL: Row Level Security</strong> (click to expand)</summary>
-
-```sql
-alter table thoughts enable row level security;
-
-create policy "Service role full access"
-  on thoughts
-  for all
-  using (auth.role() = 'service_role');
-```
-
-</details>
-
-![2.5](https://img.shields.io/badge/2.5-Grant_Table_Permissions-555?style=for-the-badge&labelColor=F4511E)
-
-New query → paste and Run:
-
-<details>
-<summary>📋 <strong>SQL: Grant service_role access</strong> (click to expand)</summary>
-
-```sql
--- Allow the service_role to read and write thoughts
-grant select, insert, update, delete on table public.thoughts to service_role;
-```
-
-</details>
+Open [`schemas/open-brain.sql`](../schemas/open-brain.sql), copy the full file,
+paste it into the editor, and click **Run**.
 
 > [!IMPORTANT]
-> This step is required. Supabase no longer grants full table permissions to `service_role` by default on new projects. Without this, your MCP server will return "permission denied for table thoughts" when trying to capture or search.
-
-![2.6](https://img.shields.io/badge/2.6-Add_Deduplication-555?style=for-the-badge&labelColor=F4511E)
-
-New query → paste and Run:
-
-<details>
-<summary>📋 <strong>SQL: Content fingerprint column + upsert function</strong> (click to expand)</summary>
-
-```sql
--- Add fingerprint column for deduplication
-ALTER TABLE thoughts ADD COLUMN content_fingerprint TEXT;
-
--- Unique index so duplicate content is detected
-CREATE UNIQUE INDEX idx_thoughts_fingerprint
-  ON thoughts (content_fingerprint)
-  WHERE content_fingerprint IS NOT NULL;
-
--- Upsert function: inserts new thoughts, merges metadata on duplicates
-CREATE OR REPLACE FUNCTION upsert_thought(p_content TEXT, p_payload JSONB DEFAULT '{}')
-RETURNS JSONB AS $$
-DECLARE
-  v_fingerprint TEXT;
-  v_result JSONB;
-  v_id UUID;
-BEGIN
-  v_fingerprint := encode(sha256(convert_to(
-    lower(trim(regexp_replace(p_content, '\s+', ' ', 'g'))),
-    'UTF8'
-  )), 'hex');
-
-  INSERT INTO thoughts (content, content_fingerprint, metadata)
-  VALUES (p_content, v_fingerprint, COALESCE(p_payload->'metadata', '{}'::jsonb))
-  ON CONFLICT (content_fingerprint) WHERE content_fingerprint IS NOT NULL DO UPDATE
-  SET updated_at = now(),
-      metadata = thoughts.metadata || COALESCE(EXCLUDED.metadata, '{}'::jsonb)
-  RETURNING id INTO v_id;
-
-  v_result := jsonb_build_object('id', v_id, 'fingerprint', v_fingerprint);
-  RETURN v_result;
-END;
-$$ LANGUAGE plpgsql;
-```
-
-</details>
+> `schemas/open-brain.sql` includes the `thoughts` table, indexes, row-level
+> security, service-role grants, deduplication column/index, and helper
+> functions (`match_thoughts`, `upsert_thought`). This step is required.
+> Supabase no longer grants full table permissions to `service_role` by default
+> on new projects. Without this, your MCP server will return "permission denied
+> for table thoughts" when trying to capture or search.
 
 > This prevents duplicate thoughts from cluttering your database. When you capture the same thought twice, it merges the metadata instead of creating a second row.
 
-![2.7](https://img.shields.io/badge/2.7-Verify-555?style=for-the-badge&labelColor=F4511E)
+![2.3](https://img.shields.io/badge/2.3-Verify-555?style=for-the-badge&labelColor=F4511E)
 
 ✅ **Done when:** Table Editor shows the `thoughts` table with columns: id, content, embedding, metadata, content_fingerprint, created_at, updated_at. Database → Functions shows `match_thoughts` and `upsert_thought`.
 
