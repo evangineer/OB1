@@ -73,7 +73,7 @@ create policy "Service role full access"
   for all
   using (auth.role() = 'service_role');
 
-grant select, insert, update, delete on table public.thoughts to service_role;
+grant select, insert, update, delete on table thoughts to service_role;
 
 alter table thoughts add column if not exists content_fingerprint text;
 
