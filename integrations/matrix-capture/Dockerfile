@@ -1,6 +1,6 @@
-ARG WOLFI_NODE_IMAGE=ghcr.io/gitguardian/wolfi/node
+ARG NODE_IMAGE=node:22-alpine
 
-FROM ${WOLFI_NODE_IMAGE}
+FROM ${NODE_IMAGE}
 
 WORKDIR /app
 
