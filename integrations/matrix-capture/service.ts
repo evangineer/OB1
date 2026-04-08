@@ -306,6 +306,38 @@ async function main(): Promise<void> {
     storagePassword: MATRIX_USE_INDEXEDDB ? MATRIX_CRYPTO_STORE_PASSWORD : undefined,
   });
 
+  const crypto = client.getCrypto();
+  if (!crypto) {
+    throw new Error("Matrix crypto failed to initialize");
+  }
+
+  try {
+    await crypto.bootstrapCrossSigning({});
+    console.log("Cross-signing bootstrap complete");
+  } catch (error) {
+    console.warn("Cross-signing bootstrap did not complete:", error);
+  }
+
+  try {
+    await crypto.loadSessionBackupPrivateKeyFromSecretStorage();
+    console.log("Loaded session backup private key from secret storage");
+  } catch (error) {
+    console.warn("Failed to load session backup private key from secret storage:", error);
+  }
+
+  try {
+    const backupCheck = await crypto.checkKeyBackupAndEnable();
+    if (backupCheck) {
+      console.log(
+        `Key backup check complete: trusted=${backupCheck.trustInfo.trusted} matches=${backupCheck.trustInfo.matchesDecryptionKey}`
+      );
+    } else {
+      console.log("No key backup configured on server");
+    }
+  } catch (error) {
+    console.warn("Key backup check failed:", error);
+  }
+
   client.on(matrixSdk.RoomEvent.MyMembership, (room, membership) => {
     if (!MATRIX_AUTOJOIN_INVITES) return;
     if (membership !== matrixSdk.KnownMembership.Invite) return;
