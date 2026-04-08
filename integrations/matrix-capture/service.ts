@@ -10,6 +10,7 @@ const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY!;
 const MATRIX_HOMESERVER_URL = process.env.MATRIX_HOMESERVER_URL!;
 const MATRIX_ACCESS_TOKEN = process.env.MATRIX_ACCESS_TOKEN!;
 const MATRIX_USER_ID = process.env.MATRIX_USER_ID!;
+const MATRIX_DEVICE_ID = process.env.MATRIX_DEVICE_ID;
 
 const OPENROUTER_BASE = process.env.OPENROUTER_BASE || "https://openrouter.ai/api/v1";
 const EMBEDDING_MODEL = process.env.EMBEDDING_MODEL || "openai/text-embedding-3-small";
@@ -42,6 +43,30 @@ type MatrixRoom = matrixSdk.Room;
 
 function requireEnv(name: string, value: string | undefined): void {
   if (!value) throw new Error(`Missing required environment variable: ${name}`);
+}
+
+async function resolveDeviceId(): Promise<string> {
+  if (MATRIX_DEVICE_ID) return MATRIX_DEVICE_ID;
+
+  const response = await fetch(
+    `${MATRIX_HOMESERVER_URL.replace(/\/+$/, "")}/_matrix/client/v3/account/whoami`,
+    {
+      headers: {
+        Authorization: `Bearer ${MATRIX_ACCESS_TOKEN}`,
+      },
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(`Failed to resolve Matrix device ID: ${response.status} ${response.statusText}`);
+  }
+
+  const body = (await response.json()) as { device_id?: string };
+  if (!body.device_id) {
+    throw new Error("Matrix /account/whoami response did not include device_id");
+  }
+
+  return body.device_id;
 }
 
 function ensurePersistentIndexedDb(): void {
@@ -258,11 +283,13 @@ async function main(): Promise<void> {
   requireEnv("MATRIX_ACCESS_TOKEN", MATRIX_ACCESS_TOKEN);
   requireEnv("MATRIX_USER_ID", MATRIX_USER_ID);
   ensurePersistentIndexedDb();
+  const deviceId = await resolveDeviceId();
 
   const client = matrixSdk.createClient({
     baseUrl: MATRIX_HOMESERVER_URL,
     accessToken: MATRIX_ACCESS_TOKEN,
     userId: MATRIX_USER_ID,
+    deviceId,
     timelineSupport: true,
     useAuthorizationHeader: true,
     cryptoCallbacks: {
