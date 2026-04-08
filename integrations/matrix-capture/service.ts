@@ -29,6 +29,7 @@ const MATRIX_MAX_EVENT_AGE_MS = Number.parseInt(
 const MATRIX_CRYPTO_DB_PREFIX = process.env.MATRIX_CRYPTO_DB_PREFIX || "ob1-matrix-capture";
 const MATRIX_CRYPTO_STORE_PASSWORD = process.env.MATRIX_CRYPTO_STORE_PASSWORD;
 const MATRIX_INDEXEDDB_PATH = process.env.MATRIX_INDEXEDDB_PATH || "/data/indexeddb";
+const MATRIX_USE_INDEXEDDB = (process.env.MATRIX_USE_INDEXEDDB || "false") === "true";
 const MATRIX_SECRET_STORAGE_KEY = process.env.MATRIX_SECRET_STORAGE_KEY;
 const MATRIX_SECRET_STORAGE_KEY_BASE64 = process.env.MATRIX_SECRET_STORAGE_KEY_BASE64;
 const MATRIX_SECRET_STORAGE_PASSPHRASE = process.env.MATRIX_SECRET_STORAGE_PASSPHRASE;
@@ -282,7 +283,9 @@ async function main(): Promise<void> {
   requireEnv("MATRIX_HOMESERVER_URL", MATRIX_HOMESERVER_URL);
   requireEnv("MATRIX_ACCESS_TOKEN", MATRIX_ACCESS_TOKEN);
   requireEnv("MATRIX_USER_ID", MATRIX_USER_ID);
-  ensurePersistentIndexedDb();
+  if (MATRIX_USE_INDEXEDDB) {
+    ensurePersistentIndexedDb();
+  }
   const deviceId = await resolveDeviceId();
 
   const client = matrixSdk.createClient({
@@ -298,9 +301,9 @@ async function main(): Promise<void> {
   });
 
   await client.initRustCrypto({
-    useIndexedDB: true,
-    cryptoDatabasePrefix: MATRIX_CRYPTO_DB_PREFIX,
-    storagePassword: MATRIX_CRYPTO_STORE_PASSWORD,
+    useIndexedDB: MATRIX_USE_INDEXEDDB,
+    cryptoDatabasePrefix: MATRIX_USE_INDEXEDDB ? MATRIX_CRYPTO_DB_PREFIX : undefined,
+    storagePassword: MATRIX_USE_INDEXEDDB ? MATRIX_CRYPTO_STORE_PASSWORD : undefined,
   });
 
   client.on(matrixSdk.RoomEvent.MyMembership, (room, membership) => {

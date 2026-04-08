@@ -8,12 +8,13 @@ This integration runs a persistent Matrix client, enables Rust crypto through `m
 
 This is the correct architecture if encrypted rooms matter. The Matrix SDK documentation says `initRustCrypto()` normally uses IndexedDB and that outside the browser you otherwise fall back to `useIndexedDB: false`, which is an ephemeral in-memory store. That makes short-lived Edge Functions a poor fit for E2EE device state. This integration therefore uses a long-running capture service instead of making E2EE claims on top of a stateless function.
 
+In practice, generic Node/container deployments should default to `MATRIX_USE_INDEXEDDB=false`. Only enable IndexedDB if you have validated a persistent IndexedDB runtime that works reliably with the Matrix SDK Rust crypto path. Without IndexedDB, restarts should recover crypto state from Matrix secret storage and key backup rather than from a local crypto database.
+
 ## Prerequisites
 
 - Working Open Brain setup ([guide](../../docs/01-getting-started.md))
 - A Matrix homeserver you control or can administer
 - A Matrix bot user with access to the rooms you want to capture
-- A deployment runtime that provides persistent `indexedDB` storage to the service process
 - Node.js 20+ or another runtime compatible with this service wrapper
 - OpenRouter API key for embeddings and metadata extraction
 - If you want to unlock encrypted history and backups on first startup, your Matrix secret storage recovery material
@@ -60,9 +61,9 @@ Create or register a dedicated Matrix user for capture traffic on your homeserve
 
 ![Step 2](https://img.shields.io/badge/Step_2-Choose_Your_Event_Flow-00897B?style=for-the-badge)
 
-This integration uses a long-running service model: one Matrix client, one persistent crypto store, one device identity. That aligns with the SDK's thread-safety and storage requirements for Rust crypto.
+This integration uses a long-running service model: one Matrix client, one device identity, and optional local crypto persistence when the runtime supports it.
 
-`✅ **Done when:**` you are planning to run exactly one long-lived capture process per Matrix device/crypto database.
+`✅ **Done when:**` you are planning to run exactly one long-lived capture process per Matrix device.
 
 ![Step 3](https://img.shields.io/badge/Step_3-Install_the_Capture_Service-00897B?style=for-the-badge)
 
@@ -80,7 +81,7 @@ npm run start
 
 The main runtime file is [`service.ts`](./service.ts). The older [`index.ts`](./index.ts) remains as a stateless polling example for unencrypted rooms, but it is not the E2EE path.
 
-`✅ **Done when:**` your deployment repo runs `service.ts` as a long-lived process and preserves its local crypto database across restarts.
+`✅ **Done when:**` your deployment repo runs `service.ts` as a long-lived process and can decrypt messages for the trusted Matrix device you configured.
 
 ![Step 3.1](https://img.shields.io/badge/3.1-Docker_Compose-555?style=for-the-badge&labelColor=00897B)
 
@@ -90,7 +91,7 @@ If Docker Compose is your standard target, this folder now includes:
 - [`docker-compose.yml`](./docker-compose.yml)
 - [`env.matrix-capture.example`](./env.matrix-capture.example)
 
-The Dockerfile now defaults to the GitGuardian Wolfi Node image (`ghcr.io/gitguardian/wolfi/node`). The container mounts `/data` as a named volume. The service uses `indexeddbshim` to provide persistent IndexedDB-backed crypto storage at `/data/indexeddb`, which is what makes the long-lived E2EE client model workable in a Node container.
+The Dockerfile now defaults to a Debian-based Node image. The container still mounts `/data` as a named volume, but the recommended default for generic Node/container deployments is `MATRIX_USE_INDEXEDDB=false`. Only enable IndexedDB storage if you have validated that your runtime supports the Matrix SDK Rust crypto IndexedDB path reliably.
 
 **1. Copy the example env file:**
 ```bash
@@ -109,18 +110,18 @@ docker compose up -d --build
 docker compose logs -f matrix-capture
 ```
 
-`✅ **Done when:**` the `matrix-capture` container is running and the named volume persists the crypto store across restarts.
+`✅ **Done when:**` the `matrix-capture` container is running and the trusted Matrix device can decrypt monitored room traffic.
 
 ## Acceptance Criteria
 
 Use this checklist before calling the deployment good:
 
-- The image builds successfully from the Wolfi-based [`Dockerfile`](./Dockerfile) with `docker compose up -d --build`
+- The image builds successfully from the provided [`Dockerfile`](./Dockerfile) with `docker compose up -d --build`
 - The container starts without `npm install` errors or module resolution failures
 - Service logs show `Matrix client prepared`
-- Service logs do not show IndexedDB initialization failures
-- The container can write to `MATRIX_INDEXEDDB_PATH` and `/data/indexeddb` persists across restart
-- Restarting the container does not create a fresh Matrix device or lose crypto continuity
+- Service logs do not show Rust crypto initialization failures
+- If `MATRIX_USE_INDEXEDDB=true`, the container can write to `MATRIX_INDEXEDDB_PATH` and `/data/indexeddb` persists across restart
+- If `MATRIX_USE_INDEXEDDB=false`, restarts rely on Matrix secret storage / key backup rather than local IndexedDB continuity
 - A newly sent message in a monitored encrypted room is decrypted and logged as `Captured <event_id>`
 - The corresponding row appears in `thoughts` with `metadata.matrix_event_id`
 - Re-sending the same event through restart/re-sync does not produce a duplicate row
@@ -139,9 +140,9 @@ docker compose up -d --build
 docker compose logs -f matrix-capture
 ```
 
-Look for `Matrix client prepared` and absence of IndexedDB startup errors.
+Look for `Matrix client prepared` and absence of Rust crypto startup errors.
 
-**3. Confirm the crypto store path exists in the container:**
+**3. Confirm the crypto store path exists in the container if IndexedDB is enabled:**
 ```bash
 docker compose exec matrix-capture ls -la /data/indexeddb
 ```
@@ -152,7 +153,7 @@ docker compose restart matrix-capture
 docker compose logs -f matrix-capture
 ```
 
-The service should come back without behaving like a brand-new Matrix device.
+The service should come back without behaving like an untrusted Matrix device.
 
 **5. Validate capture in Open Brain:**
 Check your `thoughts` table for a new row whose metadata includes `matrix_event_id`, `matrix_room_id`, and `matrix_encrypted: true`.
@@ -171,9 +172,8 @@ Set the environment variables your service needs:
 - `MATRIX_ACCESS_TOKEN`
 - `MATRIX_USER_ID`
 - `MATRIX_ROOM_IDS` as a comma-separated allowlist
-- `MATRIX_CRYPTO_DB_PREFIX` to name the IndexedDB crypto store
-- `MATRIX_CRYPTO_STORE_PASSWORD` to encrypt the local IndexedDB crypto store
-- `MATRIX_INDEXEDDB_PATH` for the persistent IndexedDB storage path inside the container or host
+- `MATRIX_USE_INDEXEDDB` to opt into the IndexedDB-backed Rust crypto path
+- `MATRIX_CRYPTO_DB_PREFIX`, `MATRIX_CRYPTO_STORE_PASSWORD`, and `MATRIX_INDEXEDDB_PATH` only if `MATRIX_USE_INDEXEDDB=true`
 - One of:
   `MATRIX_SECRET_STORAGE_KEY_BASE64`, `MATRIX_SECRET_STORAGE_KEY`, or `MATRIX_SECRET_STORAGE_PASSPHRASE`
 - Optional:
@@ -189,6 +189,7 @@ export MATRIX_HOMESERVER_URL=https://matrix.example.com
 export MATRIX_ACCESS_TOKEN=your-matrix-access-token
 export MATRIX_USER_ID=@ob1-bot:example.com
 export MATRIX_ROOM_IDS='!roomA:example.com,!roomB:example.com'
+export MATRIX_USE_INDEXEDDB=false
 export MATRIX_CRYPTO_DB_PREFIX=ob1-matrix-capture
 export MATRIX_CRYPTO_STORE_PASSWORD=choose-a-local-store-password
 export MATRIX_INDEXEDDB_PATH=/data/indexeddb
@@ -229,11 +230,11 @@ Duplicate inserts are avoided because deduplication happens on `metadata.matrix_
 
 ## Troubleshooting
 
-**Issue: The process exits with an IndexedDB error**
-Solution: Confirm the container has write access to `/data/indexeddb` and that the named volume is mounted. This Compose setup uses `indexeddbshim` to back IndexedDB with persistent on-disk storage inside the container.
+**Issue: Rust crypto fails during IndexedDB startup in Node**
+Solution: Set `MATRIX_USE_INDEXEDDB=false` and restart the service. The Matrix SDK's Node-safe fallback is the in-memory Rust crypto path. Only re-enable IndexedDB after validating that your runtime supports it reliably.
 
-**Issue: The Wolfi image builds but the container fails during `npm install`**
-Solution: Inspect the build output from `docker compose up --build`. The acceptance test for the Wolfi switch is simply that dependency installation and container startup succeed in your environment. If a native dependency in the `indexeddbshim` path fails under Wolfi, adjust the image or dependency path in your deployment repo before relying on it for encrypted capture.
+**Issue: Native dependencies fail to build under the container base image**
+Solution: Inspect the build output from `docker compose up --build`. If a native dependency in the optional `indexeddbshim` path fails, keep `MATRIX_USE_INDEXEDDB=false` and fix the image or dependency path before relying on IndexedDB-backed crypto continuity.
 
 **Issue: The service sees encrypted events but never captures them**
 Solution: Verify the bot device from a trusted Matrix client and confirm it has actually received the Megolm session keys for that room. Without device trust and room keys, the SDK cannot decrypt the message payload.
@@ -246,8 +247,8 @@ Solution: Check `SUPABASE_SERVICE_ROLE_KEY`, `OPENROUTER_API_KEY`, and your `tho
 
 ## Runtime Notes
 
-- [`service.ts`](./service.ts) is the E2EE-capable path. It initializes Rust crypto with `initRustCrypto({ useIndexedDB: true, ... })`, which matches the Matrix SDK guidance for persistent crypto state.
-- In the Docker Compose path, [`service.ts`](./service.ts) bootstraps `indexeddbshim` when native `indexedDB` is unavailable, storing the crypto DB under `MATRIX_INDEXEDDB_PATH`.
+- [`service.ts`](./service.ts) is the E2EE-capable path. It initializes Rust crypto through `initRustCrypto(...)`.
+- In the Docker Compose path, [`service.ts`](./service.ts) defaults to the Node-safe `useIndexedDB: false` path. If `MATRIX_USE_INDEXEDDB=true`, it bootstraps `indexeddbshim` when native `indexedDB` is unavailable and stores the crypto DB under `MATRIX_INDEXEDDB_PATH`.
 - [`index.ts`](./index.ts) is still useful as a stateless polling example for unencrypted rooms, but it should not be used as the primary design when encrypted capture matters.
 
 ## Multi-User Note
