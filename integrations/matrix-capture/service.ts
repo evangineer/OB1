@@ -5,7 +5,6 @@ import { VerificationMethod } from "matrix-js-sdk/lib/types.js";
 import { decodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key.js";
 import { deriveRecoveryKeyFromPassphrase } from "matrix-js-sdk/lib/crypto-api/key-passphrase.js";
 import {
-  VerificationPhase,
   VerifierEvent,
   type GeneratedSas,
   type ShowSasCallbacks,
@@ -310,14 +309,12 @@ async function handleVerificationRequest(
   }
 
   console.log(
-    `Handling self-verification request ${requestId} from ${request.otherUserId} device ${request.otherDeviceId || "unknown"} phase=${VerificationPhase[request.phase]} initiatedByMe=${request.initiatedByMe}`
+    `Handling self-verification request ${requestId} from ${request.otherUserId} device ${request.otherDeviceId || "unknown"}`
   );
 
   try {
     await request.accept();
-    console.log(
-      `Accepted verification request ${requestId}; phase=${VerificationPhase[request.phase]} methods=${request.methods.join(",") || "unknown"}`
-    );
+    console.log(`Accepted verification request ${requestId}`);
 
     const verifier = await waitForVerifier(requestId, request);
 
@@ -347,40 +344,22 @@ async function waitForVerifier(
   request: VerificationRequest
 ) {
   if (request.verifier) {
-    console.log(
-      `Verification request ${requestId} already has verifier; phase=${VerificationPhase[request.phase]}`
-    );
+    console.log(`Verification request ${requestId} already has verifier`);
     return request.verifier;
   }
 
   const start = Date.now();
-  let lastSignature = "";
 
   while (Date.now() - start < 30000) {
-    const signature = `${request.phase}:${request.chosenMethod || "unset"}:${request.verifier ? "yes" : "no"}`;
-    if (signature !== lastSignature) {
-      lastSignature = signature;
-      console.log(
-        `Verification request ${requestId} state: phase=${VerificationPhase[request.phase]} chosenMethod=${request.chosenMethod || "unset"} verifier=${request.verifier ? "yes" : "no"}`
-      );
-    }
-
     if (request.verifier) {
+      console.log(`Verification request ${requestId} obtained verifier`);
       return request.verifier;
-    }
-
-    if (request.phase === VerificationPhase.Cancelled) {
-      throw new Error(
-        `Verification request ${requestId} cancelled before verifier creation with code ${request.cancellationCode || "unknown"}`
-      );
     }
 
     await new Promise((resolve) => setTimeout(resolve, 250));
   }
 
-  throw new Error(
-    `Timed out waiting for verifier on request ${requestId}; phase=${VerificationPhase[request.phase]}`
-  );
+  throw new Error(`Timed out waiting for verifier on request ${requestId}`);
 }
 
 async function main(): Promise<void> {
