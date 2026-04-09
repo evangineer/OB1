@@ -1,7 +1,7 @@
 import { mkdirSync } from "node:fs";
 import * as matrixSdk from "matrix-js-sdk";
 import setGlobalVars from "indexeddbshim/src/node-UnicodeIdentifiers";
-import { deriveRecoveryKeyFromPassphrase } from "matrix-js-sdk/lib/crypto-api";
+import { decodeRecoveryKey, deriveRecoveryKeyFromPassphrase } from "matrix-js-sdk/lib/crypto-api";
 import { createClient } from "@supabase/supabase-js";
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
@@ -108,7 +108,7 @@ async function getSecretStorageKey(
   }
 
   if (MATRIX_SECRET_STORAGE_KEY) {
-    return [keyId, new TextEncoder().encode(MATRIX_SECRET_STORAGE_KEY)];
+    return [keyId, decodeRecoveryKey(MATRIX_SECRET_STORAGE_KEY)];
   }
 
   if (MATRIX_SECRET_STORAGE_PASSPHRASE && "passphrase" in keyInfo && keyInfo.passphrase) {
