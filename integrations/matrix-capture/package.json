@@ -4,7 +4,8 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "start": "tsx service.ts"
+    "start": "tsx service.ts",
+    "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {
     "@supabase/supabase-js": "^2.47.10",

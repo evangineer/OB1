@@ -1,7 +1,15 @@
 import { mkdirSync } from "node:fs";
 import * as matrixSdk from "matrix-js-sdk";
 import setGlobalVars from "indexeddbshim/src/node-UnicodeIdentifiers";
-import { decodeRecoveryKey, deriveRecoveryKeyFromPassphrase } from "matrix-js-sdk/lib/crypto-api";
+import { VerificationMethod } from "matrix-js-sdk/lib/types.js";
+import { decodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key.js";
+import { deriveRecoveryKeyFromPassphrase } from "matrix-js-sdk/lib/crypto-api/key-passphrase.js";
+import {
+  VerifierEvent,
+  type GeneratedSas,
+  type ShowSasCallbacks,
+  type VerificationRequest,
+} from "matrix-js-sdk/lib/crypto-api/verification.js";
 import { createClient } from "@supabase/supabase-js";
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
@@ -36,6 +44,7 @@ const MATRIX_SECRET_STORAGE_PASSPHRASE = process.env.MATRIX_SECRET_STORAGE_PASSP
 
 const ALLOWED_MSG_TYPES = new Set(["m.text", "m.notice"]);
 const seenEventIds = new Set<string>();
+const handledVerificationRequests = new Set<string>();
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
@@ -75,8 +84,8 @@ function ensurePersistentIndexedDb(): void {
 
   mkdirSync(MATRIX_INDEXEDDB_PATH, { recursive: true });
 
-  const globalWithWindow = globalThis as typeof globalThis & { window: typeof globalThis };
-  globalWithWindow.window = globalThis;
+  const globalWithWindow = globalThis as typeof globalThis & { window: Window & typeof globalThis };
+  globalWithWindow.window = globalThis as Window & typeof globalThis;
 
   setGlobalVars(globalThis, {
     checkOrigin: false,
@@ -276,6 +285,61 @@ function queueCapture(event: MatrixEvent, room: MatrixRoom, toStartOfTimeline?: 
   }
 }
 
+function formatSas(sas: GeneratedSas): string {
+  if (sas.emoji?.length) {
+    return sas.emoji.map((entry: [string, string]) => `${entry[0]} ${entry[1]}`).join(" | ");
+  }
+
+  if (sas.decimal?.length) {
+    return sas.decimal.join("-");
+  }
+
+  return "unavailable";
+}
+
+async function handleVerificationRequest(
+  request: VerificationRequest
+): Promise<void> {
+  const requestId = request.transactionId || `${request.otherUserId}:${request.otherDeviceId || "unknown"}`;
+  if (handledVerificationRequests.has(requestId)) return;
+  handledVerificationRequests.add(requestId);
+
+  if (request.otherUserId !== MATRIX_USER_ID) {
+    return;
+  }
+
+  console.log(
+    `Handling self-verification request ${requestId} from ${request.otherUserId} device ${request.otherDeviceId || "unknown"}`
+  );
+
+  try {
+    await request.accept();
+
+    const verifier =
+      request.verifier ||
+      (await request.startVerification(VerificationMethod.Sas));
+
+    verifier.on(VerifierEvent.ShowSas, (callbacks: ShowSasCallbacks) => {
+      console.log(
+        `Auto-confirming SAS for request ${requestId}: ${formatSas(callbacks.sas)}`
+      );
+      void callbacks.confirm().catch((error: unknown) => {
+        console.error(`Failed to confirm SAS for request ${requestId}:`, error);
+      });
+    });
+
+    verifier.on(VerifierEvent.Cancel, (error: Error | MatrixEvent) => {
+      console.warn(`Verification ${requestId} was cancelled:`, error);
+    });
+
+    await verifier.verify();
+    console.log(`Verification ${requestId} completed`);
+  } catch (error) {
+    handledVerificationRequests.delete(requestId);
+    console.error(`Failed to handle verification request ${requestId}:`, error);
+  }
+}
+
 async function main(): Promise<void> {
   requireEnv("SUPABASE_URL", SUPABASE_URL);
   requireEnv("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_ROLE_KEY);
@@ -302,7 +366,6 @@ async function main(): Promise<void> {
 
   await client.initRustCrypto({
     useIndexedDB: MATRIX_USE_INDEXEDDB,
-    cryptoDatabasePrefix: MATRIX_USE_INDEXEDDB ? MATRIX_CRYPTO_DB_PREFIX : undefined,
     storagePassword: MATRIX_USE_INDEXEDDB ? MATRIX_CRYPTO_STORE_PASSWORD : undefined,
   });
 
@@ -352,6 +415,14 @@ async function main(): Promise<void> {
   client.on(matrixSdk.RoomEvent.Timeline, (event, room, toStartOfTimeline) => {
     if (!room) return;
     queueCapture(event, room, toStartOfTimeline);
+  });
+
+  (
+    crypto as unknown as {
+      on: (event: string, listener: (request: VerificationRequest) => void) => void;
+    }
+  ).on(matrixSdk.CryptoEvent.VerificationRequestReceived, (request: VerificationRequest) => {
+    void handleVerificationRequest(request);
   });
 
   client.once(matrixSdk.ClientEvent.Sync, (state) => {
