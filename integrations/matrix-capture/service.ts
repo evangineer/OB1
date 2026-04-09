@@ -6,7 +6,6 @@ import { decodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key.js"
 import { deriveRecoveryKeyFromPassphrase } from "matrix-js-sdk/lib/crypto-api/key-passphrase.js";
 import {
   VerificationPhase,
-  VerificationRequestEvent,
   VerifierEvent,
   type GeneratedSas,
   type ShowSasCallbacks,
@@ -354,45 +353,34 @@ async function waitForVerifier(
     return request.verifier;
   }
 
-  return await new Promise<NonNullable<VerificationRequest["verifier"]>>((resolve, reject) => {
-    const timeout = setTimeout(() => {
-      cleanup();
-      reject(
-        new Error(
-          `Timed out waiting for verifier on request ${requestId}; phase=${VerificationPhase[request.phase]}`
-        )
-      );
-    }, 30000);
+  const start = Date.now();
+  let lastSignature = "";
 
-    const onChange = () => {
+  while (Date.now() - start < 30000) {
+    const signature = `${request.phase}:${request.chosenMethod || "unset"}:${request.verifier ? "yes" : "no"}`;
+    if (signature !== lastSignature) {
+      lastSignature = signature;
       console.log(
-        `Verification request ${requestId} changed: phase=${VerificationPhase[request.phase]} chosenMethod=${request.chosenMethod || "unset"} verifier=${request.verifier ? "yes" : "no"}`
+        `Verification request ${requestId} state: phase=${VerificationPhase[request.phase]} chosenMethod=${request.chosenMethod || "unset"} verifier=${request.verifier ? "yes" : "no"}`
       );
+    }
 
-      if (request.verifier) {
-        cleanup();
-        resolve(request.verifier);
-        return;
-      }
+    if (request.verifier) {
+      return request.verifier;
+    }
 
-      if (request.phase === VerificationPhase.Cancelled) {
-        cleanup();
-        reject(
-          new Error(
-            `Verification request ${requestId} cancelled before verifier creation with code ${request.cancellationCode || "unknown"}`
-          )
-        );
-      }
-    };
+    if (request.phase === VerificationPhase.Cancelled) {
+      throw new Error(
+        `Verification request ${requestId} cancelled before verifier creation with code ${request.cancellationCode || "unknown"}`
+      );
+    }
 
-    const cleanup = () => {
-      clearTimeout(timeout);
-      request.off(VerificationRequestEvent.Change, onChange);
-    };
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
 
-    request.on(VerificationRequestEvent.Change, onChange);
-    onChange();
-  });
+  throw new Error(
+    `Timed out waiting for verifier on request ${requestId}; phase=${VerificationPhase[request.phase]}`
+  );
 }
 
 async function main(): Promise<void> {
