@@ -5,6 +5,8 @@ import { VerificationMethod } from "matrix-js-sdk/lib/types.js";
 import { decodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key.js";
 import { deriveRecoveryKeyFromPassphrase } from "matrix-js-sdk/lib/crypto-api/key-passphrase.js";
 import {
+  VerificationPhase,
+  VerificationRequestEvent,
   VerifierEvent,
   type GeneratedSas,
   type ShowSasCallbacks,
@@ -309,15 +311,16 @@ async function handleVerificationRequest(
   }
 
   console.log(
-    `Handling self-verification request ${requestId} from ${request.otherUserId} device ${request.otherDeviceId || "unknown"}`
+    `Handling self-verification request ${requestId} from ${request.otherUserId} device ${request.otherDeviceId || "unknown"} phase=${VerificationPhase[request.phase]} initiatedByMe=${request.initiatedByMe}`
   );
 
   try {
     await request.accept();
+    console.log(
+      `Accepted verification request ${requestId}; phase=${VerificationPhase[request.phase]} methods=${request.methods.join(",") || "unknown"}`
+    );
 
-    const verifier =
-      request.verifier ||
-      (await request.startVerification(VerificationMethod.Sas));
+    const verifier = await waitForVerifier(requestId, request);
 
     verifier.on(VerifierEvent.ShowSas, (callbacks: ShowSasCallbacks) => {
       console.log(
@@ -338,6 +341,58 @@ async function handleVerificationRequest(
     handledVerificationRequests.delete(requestId);
     console.error(`Failed to handle verification request ${requestId}:`, error);
   }
+}
+
+async function waitForVerifier(
+  requestId: string,
+  request: VerificationRequest
+) {
+  if (request.verifier) {
+    console.log(
+      `Verification request ${requestId} already has verifier; phase=${VerificationPhase[request.phase]}`
+    );
+    return request.verifier;
+  }
+
+  return await new Promise<NonNullable<VerificationRequest["verifier"]>>((resolve, reject) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      reject(
+        new Error(
+          `Timed out waiting for verifier on request ${requestId}; phase=${VerificationPhase[request.phase]}`
+        )
+      );
+    }, 30000);
+
+    const onChange = () => {
+      console.log(
+        `Verification request ${requestId} changed: phase=${VerificationPhase[request.phase]} chosenMethod=${request.chosenMethod || "unset"} verifier=${request.verifier ? "yes" : "no"}`
+      );
+
+      if (request.verifier) {
+        cleanup();
+        resolve(request.verifier);
+        return;
+      }
+
+      if (request.phase === VerificationPhase.Cancelled) {
+        cleanup();
+        reject(
+          new Error(
+            `Verification request ${requestId} cancelled before verifier creation with code ${request.cancellationCode || "unknown"}`
+          )
+        );
+      }
+    };
+
+    const cleanup = () => {
+      clearTimeout(timeout);
+      request.off(VerificationRequestEvent.Change, onChange);
+    };
+
+    request.on(VerificationRequestEvent.Change, onChange);
+    onChange();
+  });
 }
 
 async function main(): Promise<void> {
