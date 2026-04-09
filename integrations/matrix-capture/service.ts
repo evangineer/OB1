@@ -1,5 +1,5 @@
 import { mkdirSync } from "node:fs";
-import * as matrixSdk from "matrix-js-sdk";
+import type * as MatrixSdk from "matrix-js-sdk";
 import setGlobalVars from "indexeddbshim/src/node-UnicodeIdentifiers";
 import { VerificationMethod } from "matrix-js-sdk/lib/types.js";
 import { decodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key.js";
@@ -47,9 +47,19 @@ const seenEventIds = new Set<string>();
 const handledVerificationRequests = new Set<string>();
 
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+type RuntimeMatrixSdk = Pick<
+  typeof MatrixSdk,
+  | "ClientEvent"
+  | "CryptoEvent"
+  | "KnownMembership"
+  | "MatrixEventEvent"
+  | "RoomEvent"
+  | "createClient"
+>;
+let matrixSdk: RuntimeMatrixSdk;
 
-type MatrixEvent = matrixSdk.MatrixEvent;
-type MatrixRoom = matrixSdk.Room;
+type MatrixEvent = MatrixSdk.MatrixEvent;
+type MatrixRoom = MatrixSdk.Room;
 
 function requireEnv(name: string, value: string | undefined): void {
   if (!value) throw new Error(`Missing required environment variable: ${name}`);
@@ -100,12 +110,25 @@ function ensurePersistentIndexedDb(): void {
   }
 }
 
+async function loadMatrixSdk(): Promise<RuntimeMatrixSdk> {
+  if (matrixSdk) return matrixSdk;
+
+  if (MATRIX_USE_INDEXEDDB) {
+    ensurePersistentIndexedDb();
+    matrixSdk = (await import("matrix-js-sdk/lib/browser-index.js")) as RuntimeMatrixSdk;
+  } else {
+    matrixSdk = (await import("matrix-js-sdk")) as RuntimeMatrixSdk;
+  }
+
+  return matrixSdk;
+}
+
 function parseBase64Key(base64Value: string): Uint8Array {
   return Uint8Array.from(Buffer.from(base64Value, "base64"));
 }
 
 async function getSecretStorageKey(
-  keys: Record<string, matrixSdk.SecretStorage.SecretStorageKeyDescription>
+  keys: Record<string, MatrixSdk.SecretStorage.SecretStorageKeyDescription>
 ): Promise<[string, Uint8Array] | null> {
   const entries = Object.entries(keys);
   if (entries.length === 0) return null;
@@ -363,18 +386,17 @@ async function waitForVerifier(
 }
 
 async function main(): Promise<void> {
+  const sdk = await loadMatrixSdk();
+
   requireEnv("SUPABASE_URL", SUPABASE_URL);
   requireEnv("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_ROLE_KEY);
   requireEnv("OPENROUTER_API_KEY", OPENROUTER_API_KEY);
   requireEnv("MATRIX_HOMESERVER_URL", MATRIX_HOMESERVER_URL);
   requireEnv("MATRIX_ACCESS_TOKEN", MATRIX_ACCESS_TOKEN);
   requireEnv("MATRIX_USER_ID", MATRIX_USER_ID);
-  if (MATRIX_USE_INDEXEDDB) {
-    ensurePersistentIndexedDb();
-  }
   const deviceId = await resolveDeviceId();
 
-  const client = matrixSdk.createClient({
+  const client = sdk.createClient({
     baseUrl: MATRIX_HOMESERVER_URL,
     accessToken: MATRIX_ACCESS_TOKEN,
     userId: MATRIX_USER_ID,
@@ -423,9 +445,9 @@ async function main(): Promise<void> {
     console.warn("Key backup check failed:", error);
   }
 
-  client.on(matrixSdk.RoomEvent.MyMembership, (room, membership) => {
+  client.on(sdk.RoomEvent.MyMembership, (room, membership) => {
     if (!MATRIX_AUTOJOIN_INVITES) return;
-    if (membership !== matrixSdk.KnownMembership.Invite) return;
+    if (membership !== sdk.KnownMembership.Invite) return;
 
     void client.joinRoom(room.roomId).then(() => {
       console.log(`Joined invited room ${room.roomId}`);
@@ -434,7 +456,7 @@ async function main(): Promise<void> {
     });
   });
 
-  client.on(matrixSdk.RoomEvent.Timeline, (event, room, toStartOfTimeline) => {
+  client.on(sdk.RoomEvent.Timeline, (event, room, toStartOfTimeline) => {
     if (!room) return;
     queueCapture(event, room, toStartOfTimeline);
   });
@@ -443,11 +465,11 @@ async function main(): Promise<void> {
     crypto as unknown as {
       on: (event: string, listener: (request: VerificationRequest) => void) => void;
     }
-  ).on(matrixSdk.CryptoEvent.VerificationRequestReceived, (request: VerificationRequest) => {
+  ).on(sdk.CryptoEvent.VerificationRequestReceived, (request: VerificationRequest) => {
     void handleVerificationRequest(request);
   });
 
-  client.once(matrixSdk.ClientEvent.Sync, (state) => {
+  client.once(sdk.ClientEvent.Sync, (state) => {
     if (state === "PREPARED") {
       console.log("Matrix client prepared");
     }
