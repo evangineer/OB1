@@ -251,6 +251,62 @@ Solution: Check `SUPABASE_SERVICE_ROLE_KEY`, `OPENROUTER_API_KEY`, and your `tho
 - In the Docker Compose path, [`service.ts`](./service.ts) defaults to the Node-safe `useIndexedDB: false` path. If `MATRIX_USE_INDEXEDDB=true`, it bootstraps `indexeddbshim` when native `indexedDB` is unavailable and stores the crypto DB under `MATRIX_INDEXEDDB_PATH`.
 - [`index.ts`](./index.ts) is still useful as a stateless polling example for unencrypted rooms, but it should not be used as the primary design when encrypted capture matters.
 
+## Persistence Handoff
+
+The current `indexeddbshim`-based persistence path is not reliable in this project. In deployment, enabling `MATRIX_USE_INDEXEDDB=true` caused Rust crypto store startup to fail with `TransactionInactiveError`, while `MATRIX_USE_INDEXEDDB=false` ran successfully but left the device on an ephemeral in-memory crypto store. That ephemeral mode is not durable enough for stable self-verification, one-time-key reuse, or restart-safe E2EE continuity.
+
+The recommended next approach is to replace the current `indexeddbshim` path with the same general persistence model used by OpenClaw's Matrix extension rather than jumping straight to a full Rust rewrite.
+
+### Why this is the preferred next step
+
+- The container already has a persistent volume at `/data`, so the missing piece is not Docker volume persistence.
+- The failure is specifically in the Node IndexedDB runtime used by the Matrix SDK Rust crypto path.
+- OpenClaw documents a working Node persistence pattern for Matrix E2EE:
+  - use `matrix-js-sdk`
+  - provide IndexedDB in Node via `fake-indexeddb`
+  - restore a persisted IndexedDB snapshot before `initRustCrypto()`
+  - save the updated IndexedDB snapshot back to disk during runtime
+- This is a smaller and more defensible change than rewriting Matrix capture in Rust immediately.
+
+Reference material:
+
+- OpenClaw Matrix docs: <https://docs.openclaw.ai/channels/matrix>
+- OpenClaw Matrix package: <https://raw.githubusercontent.com/openclaw/openclaw/main/extensions/matrix/package.json>
+
+### Proposed implementation outline
+
+1. Remove the current `indexeddbshim`-specific persistence path from [`service.ts`](./service.ts).
+2. Add `fake-indexeddb` as the Node-side IndexedDB provider for the Matrix SDK crypto runtime.
+3. Introduce a snapshot file under `/data`, for example:
+   - `/data/crypto-idb-snapshot.json`
+4. On startup, before calling `initRustCrypto(...)`:
+   - initialize the fake IndexedDB runtime
+   - restore the persisted IndexedDB snapshot into that runtime if the snapshot file exists
+5. After crypto initialization and during runtime:
+   - persist the updated IndexedDB contents back to the snapshot file
+   - write atomically and with restrictive file permissions
+6. Keep the existing Matrix secret-storage and backup recovery logic:
+   - it still matters for first bootstrap and historical recovery
+   - the snapshot is for device continuity, not a replacement for Matrix recovery material
+7. Re-test the existing deployment flow with one fresh dedicated Matrix device:
+   - verify that restart no longer causes one-time-key collisions
+   - verify that SAS verification completes cleanly
+   - verify that a newly sent encrypted message is captured after restart
+
+### Acceptance criteria for this approach
+
+- `MATRIX_USE_INDEXEDDB=true` no longer crashes during Rust crypto store startup
+- restarting the container does not trigger repeated `/keys/upload` collisions for the same device
+- a dedicated capture device can complete self-verification successfully
+- encrypted room traffic remains decryptable after restart without re-issuing a new device token
+- the snapshot file is stored only on the persistent volume and is treated as sensitive local state
+
+### What not to do next
+
+- Do not spend more time on `indexeddbshim` unless there is a concrete fix for the exact startup failure.
+- Do not assume Docker volumes alone solve the problem; volume persistence already exists.
+- Do not jump to a Rust rewrite first unless the OpenClaw-style Node persistence model fails in this codebase too.
+
 ## Multi-User Note
 
 This long-running E2EE service should be treated as single-tenant.
