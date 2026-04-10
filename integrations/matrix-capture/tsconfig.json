@@ -8,5 +8,5 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["service.ts", "types.d.ts"]
+  "include": ["service.ts"]
 }

@@ -2,6 +2,7 @@ import "jsr:@supabase/functions-js/edge-runtime.d.ts";
 
 import * as matrixSdk from "npm:matrix-js-sdk@36.2.0";
 import { createClient } from "@supabase/supabase-js";
+import type { Database } from "./database.types.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
@@ -36,7 +37,7 @@ const MATRIX_MAX_EVENT_AGE_MS = Number.parseInt(
 );
 const ALLOWED_MSG_TYPES = new Set(["m.text", "m.notice"]);
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+const supabase = createClient<Database>(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 
 type MatrixEventLike = {
   getId?: () => string | undefined;

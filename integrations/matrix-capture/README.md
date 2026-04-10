@@ -8,7 +8,7 @@ This integration runs a persistent Matrix client, enables Rust crypto through `m
 
 This is the correct architecture if encrypted rooms matter. The Matrix SDK documentation says `initRustCrypto()` normally uses IndexedDB and that outside the browser you otherwise fall back to `useIndexedDB: false`, which is an ephemeral in-memory store. That makes short-lived Edge Functions a poor fit for E2EE device state. This integration therefore uses a long-running capture service instead of making E2EE claims on top of a stateless function.
 
-In practice, generic Node/container deployments should default to `MATRIX_USE_INDEXEDDB=false`. Only enable IndexedDB if you have validated a persistent IndexedDB runtime that works reliably with the Matrix SDK Rust crypto path. Without IndexedDB, restarts should recover crypto state from Matrix secret storage and key backup rather than from a local crypto database.
+For Node/container deployments, this service now provides its own persistent IndexedDB runtime using `fake-indexeddb` plus an on-disk snapshot under `/data`. That gives the Matrix device durable crypto state across restart without depending on `indexeddbshim`.
 
 ## Prerequisites
 
@@ -91,7 +91,7 @@ If Docker Compose is your standard target, this folder now includes:
 - [`docker-compose.yml`](./docker-compose.yml)
 - [`env.matrix-capture.example`](./env.matrix-capture.example)
 
-The Dockerfile now defaults to a Debian-based Node image. The container still mounts `/data` as a named volume, but the recommended default for generic Node/container deployments is `MATRIX_USE_INDEXEDDB=false`. Only enable IndexedDB storage if you have validated that your runtime supports the Matrix SDK Rust crypto IndexedDB path reliably.
+The Dockerfile now defaults to a Debian-based Node image. The container mounts `/data` as a named volume, and the recommended default is `MATRIX_USE_INDEXEDDB=true` so the service can persist a fake IndexedDB snapshot for Matrix Rust crypto under that volume.
 
 **1. Copy the example env file:**
 ```bash
@@ -120,7 +120,8 @@ Use this checklist before calling the deployment good:
 - The container starts without `npm install` errors or module resolution failures
 - Service logs show `Matrix client prepared`
 - Service logs do not show Rust crypto initialization failures
-- If `MATRIX_USE_INDEXEDDB=true`, the container can write to `MATRIX_INDEXEDDB_PATH` and `/data/indexeddb` persists across restart
+- If `MATRIX_USE_INDEXEDDB=true`, the container can write to both `MATRIX_INDEXEDDB_PATH` and `MATRIX_INDEXEDDB_SNAPSHOT_PATH`
+- restarting the container preserves Matrix device crypto state and does not force one-time-key re-registration for the same device
 - If `MATRIX_USE_INDEXEDDB=false`, restarts rely on Matrix secret storage / key backup rather than local IndexedDB continuity
 - A newly sent message in a monitored encrypted room is decrypted and logged as `Captured <event_id>`
 - The corresponding row appears in `thoughts` with `metadata.matrix_event_id`
@@ -161,6 +162,21 @@ Check your `thoughts` table for a new row whose metadata includes `matrix_event_
 **6. Validate deduplication:**
 Restart the service again or let it resync, then confirm no duplicate row was inserted for the same `matrix_event_id`.
 
+## Supabase Types
+
+This package includes a checked-in placeholder [`database.types.ts`](./database.types.ts) so the Matrix capture code can type its `thoughts` queries without falling back to `any`.
+
+When you have access to the target self-hosted Supabase/PostgREST database, replace that placeholder with generated types from the CLI. For a self-hosted deployment, the relevant pattern is:
+
+```bash
+npx supabase gen types typescript \
+  --db-url 'postgres://postgres.[POOLER_TENANT_ID]:[POSTGRES_PASSWORD]@[your-domain-or-ip]:5432/postgres' \
+  --schema public \
+  > integrations/matrix-capture/database.types.ts
+```
+
+If your `thoughts` table is exposed through a different schema name on the target API surface, change `--schema` accordingly before overwriting the file.
+
 ![Step 4](https://img.shields.io/badge/Step_4-Configure_Secrets-00897B?style=for-the-badge)
 
 Set the environment variables your service needs:
@@ -172,8 +188,8 @@ Set the environment variables your service needs:
 - `MATRIX_ACCESS_TOKEN`
 - `MATRIX_USER_ID`
 - `MATRIX_ROOM_IDS` as a comma-separated allowlist
-- `MATRIX_USE_INDEXEDDB` to opt into the IndexedDB-backed Rust crypto path
-- `MATRIX_CRYPTO_DB_PREFIX`, `MATRIX_CRYPTO_STORE_PASSWORD`, and `MATRIX_INDEXEDDB_PATH` only if `MATRIX_USE_INDEXEDDB=true`
+- `MATRIX_USE_INDEXEDDB` to enable the snapshot-backed IndexedDB Rust crypto path
+- `MATRIX_CRYPTO_DB_PREFIX`, `MATRIX_CRYPTO_STORE_PASSWORD`, `MATRIX_INDEXEDDB_PATH`, and optionally `MATRIX_INDEXEDDB_SNAPSHOT_PATH` if `MATRIX_USE_INDEXEDDB=true`
 - One of:
   `MATRIX_SECRET_STORAGE_KEY_BASE64`, `MATRIX_SECRET_STORAGE_KEY`, or `MATRIX_SECRET_STORAGE_PASSPHRASE`
 - Optional:
@@ -189,10 +205,11 @@ export MATRIX_HOMESERVER_URL=https://matrix.example.com
 export MATRIX_ACCESS_TOKEN=your-matrix-access-token
 export MATRIX_USER_ID=@ob1-bot:example.com
 export MATRIX_ROOM_IDS='!roomA:example.com,!roomB:example.com'
-export MATRIX_USE_INDEXEDDB=false
+export MATRIX_USE_INDEXEDDB=true
 export MATRIX_CRYPTO_DB_PREFIX=ob1-matrix-capture
 export MATRIX_CRYPTO_STORE_PASSWORD=choose-a-local-store-password
 export MATRIX_INDEXEDDB_PATH=/data/indexeddb
+export MATRIX_INDEXEDDB_SNAPSHOT_PATH=/data/indexeddb/crypto-idb-snapshot.bin
 export MATRIX_SECRET_STORAGE_PASSPHRASE='your secret storage passphrase'
 ```
 
@@ -230,11 +247,11 @@ Duplicate inserts are avoided because deduplication happens on `metadata.matrix_
 
 ## Troubleshooting
 
-**Issue: Rust crypto fails during IndexedDB startup in Node**
-Solution: Set `MATRIX_USE_INDEXEDDB=false` and restart the service. The Matrix SDK's Node-safe fallback is the in-memory Rust crypto path. Only re-enable IndexedDB after validating that your runtime supports it reliably.
+**Issue: Snapshot-backed IndexedDB startup fails in Node**
+Solution: Inspect the startup logs for snapshot restore errors. As an emergency fallback you can set `MATRIX_USE_INDEXEDDB=false` and restart the service, but that reverts the device to ephemeral in-memory crypto state.
 
-**Issue: Native dependencies fail to build under the container base image**
-Solution: Inspect the build output from `docker compose up --build`. If a native dependency in the optional `indexeddbshim` path fails, keep `MATRIX_USE_INDEXEDDB=false` and fix the image or dependency path before relying on IndexedDB-backed crypto continuity.
+**Issue: Snapshot file permissions or writes fail**
+Solution: Confirm the container can write to `MATRIX_INDEXEDDB_PATH` and `MATRIX_INDEXEDDB_SNAPSHOT_PATH` on the mounted `/data` volume. The service writes the snapshot atomically and expects restrictive file permissions.
 
 **Issue: The service sees encrypted events but never captures them**
 Solution: Verify the bot device from a trusted Matrix client and confirm it has actually received the Megolm session keys for that room. Without device trust and room keys, the SDK cannot decrypt the message payload.
@@ -248,64 +265,30 @@ Solution: Check `SUPABASE_SERVICE_ROLE_KEY`, `OPENROUTER_API_KEY`, and your `tho
 ## Runtime Notes
 
 - [`service.ts`](./service.ts) is the E2EE-capable path. It initializes Rust crypto through `initRustCrypto(...)`.
-- In the Docker Compose path, [`service.ts`](./service.ts) defaults to the Node-safe `useIndexedDB: false` path. If `MATRIX_USE_INDEXEDDB=true`, it bootstraps `indexeddbshim` when native `indexedDB` is unavailable and stores the crypto DB under `MATRIX_INDEXEDDB_PATH`.
+- In the Docker Compose path, [`service.ts`](./service.ts) now defaults to the snapshot-backed IndexedDB path in Node. If `MATRIX_USE_INDEXEDDB=true`, it bootstraps `fake-indexeddb`, restores the snapshot under `MATRIX_INDEXEDDB_SNAPSHOT_PATH`, and then initializes Rust crypto against that restored runtime.
 - [`index.ts`](./index.ts) is still useful as a stateless polling example for unencrypted rooms, but it should not be used as the primary design when encrypted capture matters.
 
-## Persistence Handoff
+## Persistence Model
 
-The current `indexeddbshim`-based persistence path is not reliable in this project. In deployment, enabling `MATRIX_USE_INDEXEDDB=true` caused Rust crypto store startup to fail with `TransactionInactiveError`, while `MATRIX_USE_INDEXEDDB=false` ran successfully but left the device on an ephemeral in-memory crypto store. That ephemeral mode is not durable enough for stable self-verification, one-time-key reuse, or restart-safe E2EE continuity.
+The current implementation follows the OpenClaw-style Node persistence model that replaced the earlier `indexeddbshim` experiment.
 
-The recommended next approach is to replace the current `indexeddbshim` path with the same general persistence model used by OpenClaw's Matrix extension rather than jumping straight to a full Rust rewrite.
-
-### Why this is the preferred next step
-
-- The container already has a persistent volume at `/data`, so the missing piece is not Docker volume persistence.
-- The failure is specifically in the Node IndexedDB runtime used by the Matrix SDK Rust crypto path.
-- OpenClaw documents a working Node persistence pattern for Matrix E2EE:
-  - use `matrix-js-sdk`
-  - provide IndexedDB in Node via `fake-indexeddb`
-  - restore a persisted IndexedDB snapshot before `initRustCrypto()`
-  - save the updated IndexedDB snapshot back to disk during runtime
-- This is a smaller and more defensible change than rewriting Matrix capture in Rust immediately.
+- `service.ts` now provides IndexedDB in Node via `fake-indexeddb`
+- on startup it restores a persisted snapshot before `initRustCrypto(...)`
+- during runtime and shutdown it writes the updated snapshot back to disk atomically
+- Matrix secret storage and key backup are still used for bootstrap and historical recovery; the snapshot is only for device continuity
 
 Reference material:
 
 - OpenClaw Matrix docs: <https://docs.openclaw.ai/channels/matrix>
 - OpenClaw Matrix package: <https://raw.githubusercontent.com/openclaw/openclaw/main/extensions/matrix/package.json>
 
-### Proposed implementation outline
+### Acceptance criteria
 
-1. Remove the current `indexeddbshim`-specific persistence path from [`service.ts`](./service.ts).
-2. Add `fake-indexeddb` as the Node-side IndexedDB provider for the Matrix SDK crypto runtime.
-3. Introduce a snapshot file under `/data`, for example:
-   - `/data/crypto-idb-snapshot.json`
-4. On startup, before calling `initRustCrypto(...)`:
-   - initialize the fake IndexedDB runtime
-   - restore the persisted IndexedDB snapshot into that runtime if the snapshot file exists
-5. After crypto initialization and during runtime:
-   - persist the updated IndexedDB contents back to the snapshot file
-   - write atomically and with restrictive file permissions
-6. Keep the existing Matrix secret-storage and backup recovery logic:
-   - it still matters for first bootstrap and historical recovery
-   - the snapshot is for device continuity, not a replacement for Matrix recovery material
-7. Re-test the existing deployment flow with one fresh dedicated Matrix device:
-   - verify that restart no longer causes one-time-key collisions
-   - verify that SAS verification completes cleanly
-   - verify that a newly sent encrypted message is captured after restart
-
-### Acceptance criteria for this approach
-
-- `MATRIX_USE_INDEXEDDB=true` no longer crashes during Rust crypto store startup
+- `MATRIX_USE_INDEXEDDB=true` starts without the old `TransactionInactiveError`
 - restarting the container does not trigger repeated `/keys/upload` collisions for the same device
 - a dedicated capture device can complete self-verification successfully
 - encrypted room traffic remains decryptable after restart without re-issuing a new device token
 - the snapshot file is stored only on the persistent volume and is treated as sensitive local state
-
-### What not to do next
-
-- Do not spend more time on `indexeddbshim` unless there is a concrete fix for the exact startup failure.
-- Do not assume Docker volumes alone solve the problem; volume persistence already exists.
-- Do not jump to a Rust rewrite first unless the OpenClaw-style Node persistence model fails in this codebase too.
 
 ## Multi-User Note
 

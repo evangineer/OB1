@@ -1,6 +1,29 @@
-import { mkdirSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { dirname, join } from "node:path";
+import { deserialize, serialize } from "node:v8";
 import type * as MatrixSdk from "matrix-js-sdk";
-import setGlobalVars from "indexeddbshim/src/node-UnicodeIdentifiers";
+import {
+  IDBCursor,
+  IDBCursorWithValue,
+  IDBDatabase,
+  IDBFactory,
+  IDBIndex,
+  IDBKeyRange,
+  IDBObjectStore,
+  IDBOpenDBRequest,
+  IDBRequest,
+  IDBTransaction,
+  IDBVersionChangeEvent,
+  indexedDB as fakeIndexedDB,
+} from "fake-indexeddb";
 import { VerificationMethod } from "matrix-js-sdk/lib/types.js";
 import { decodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key.js";
 import { deriveRecoveryKeyFromPassphrase } from "matrix-js-sdk/lib/crypto-api/key-passphrase.js";
@@ -11,6 +34,7 @@ import {
   type VerificationRequest,
 } from "matrix-js-sdk/lib/crypto-api/verification.js";
 import { createClient } from "@supabase/supabase-js";
+import type { Database } from "./database.types.js";
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
@@ -37,16 +61,18 @@ const MATRIX_MAX_EVENT_AGE_MS = Number.parseInt(
 const MATRIX_CRYPTO_DB_PREFIX = process.env.MATRIX_CRYPTO_DB_PREFIX || "ob1-matrix-capture";
 const MATRIX_CRYPTO_STORE_PASSWORD = process.env.MATRIX_CRYPTO_STORE_PASSWORD;
 const MATRIX_INDEXEDDB_PATH = process.env.MATRIX_INDEXEDDB_PATH || "/data/indexeddb";
+const MATRIX_INDEXEDDB_SNAPSHOT_PATH =
+  process.env.MATRIX_INDEXEDDB_SNAPSHOT_PATH || join(MATRIX_INDEXEDDB_PATH, "crypto-idb-snapshot.bin");
 const MATRIX_USE_INDEXEDDB = (process.env.MATRIX_USE_INDEXEDDB || "false") === "true";
 const MATRIX_SECRET_STORAGE_KEY = process.env.MATRIX_SECRET_STORAGE_KEY;
 const MATRIX_SECRET_STORAGE_KEY_BASE64 = process.env.MATRIX_SECRET_STORAGE_KEY_BASE64;
 const MATRIX_SECRET_STORAGE_PASSPHRASE = process.env.MATRIX_SECRET_STORAGE_PASSPHRASE;
+const SNAPSHOT_WRITE_INTERVAL_MS = 15_000;
 
 const ALLOWED_MSG_TYPES = new Set(["m.text", "m.notice"]);
 const seenEventIds = new Set<string>();
 const handledVerificationRequests = new Set<string>();
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 type RuntimeMatrixSdk = Pick<
   typeof MatrixSdk,
   | "ClientEvent"
@@ -57,12 +83,48 @@ type RuntimeMatrixSdk = Pick<
   | "createClient"
 >;
 let matrixSdk: RuntimeMatrixSdk;
+let supabase: ReturnType<typeof createClient<Database>> | undefined;
 
 type MatrixEvent = MatrixSdk.MatrixEvent;
 type MatrixRoom = MatrixSdk.Room;
+type MatrixIndexMetadata = {
+  keyPath: string | string[] | null;
+  multiEntry: boolean;
+  name: string;
+  unique: boolean;
+};
+type MatrixObjectStoreSnapshot = {
+  autoIncrement: boolean;
+  indexes: MatrixIndexMetadata[];
+  keyPath: string | string[] | null;
+  name: string;
+  records: Array<{ key: unknown; value: unknown }>;
+};
+type MatrixDatabaseSnapshot = {
+  name: string;
+  objectStores: MatrixObjectStoreSnapshot[];
+  version: number;
+};
+type MatrixIndexedDbSnapshot = {
+  databases: MatrixDatabaseSnapshot[];
+  savedAt: string;
+};
+
+let snapshotPersistTimer: NodeJS.Timeout | undefined;
+let snapshotPersistInFlight = false;
 
 function requireEnv(name: string, value: string | undefined): void {
   if (!value) throw new Error(`Missing required environment variable: ${name}`);
+}
+
+function getSupabaseClient(): ReturnType<typeof createClient<Database>> {
+  if (!supabase) {
+    requireEnv("SUPABASE_URL", SUPABASE_URL);
+    requireEnv("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_ROLE_KEY);
+    supabase = createClient<Database>(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+  }
+
+  return supabase;
 }
 
 async function resolveDeviceId(): Promise<string> {
@@ -89,24 +151,252 @@ async function resolveDeviceId(): Promise<string> {
   return body.device_id;
 }
 
+async function requestToPromise<T>(request: IDBRequest<T>): Promise<T> {
+  return await new Promise<T>((resolve, reject) => {
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error ?? new Error("IndexedDB request failed"));
+  });
+}
+
+async function transactionDone(transaction: IDBTransaction): Promise<void> {
+  await new Promise<void>((resolve, reject) => {
+    transaction.oncomplete = () => resolve();
+    transaction.onerror = () => reject(transaction.error ?? new Error("IndexedDB transaction failed"));
+    transaction.onabort = () => reject(transaction.error ?? new Error("IndexedDB transaction aborted"));
+  });
+}
+
+async function openDatabase(name: string, version?: number, onUpgrade?: (database: IDBDatabase) => void): Promise<IDBDatabase> {
+  const request = version === undefined ? indexedDB.open(name) : indexedDB.open(name, version);
+
+  if (onUpgrade) {
+    request.onupgradeneeded = () => {
+      onUpgrade(request.result);
+    };
+  }
+
+  return await requestToPromise(request);
+}
+
+async function withSnapshotLock<T>(fn: () => Promise<T>): Promise<T> {
+  const lockPath = `${MATRIX_INDEXEDDB_SNAPSHOT_PATH}.lock`;
+  const deadline = Date.now() + 10_000;
+
+  while (true) {
+    try {
+      mkdirSync(lockPath, { mode: 0o700 });
+      break;
+    } catch (error) {
+      if (Date.now() >= deadline) {
+        throw new Error(`Timed out waiting for Matrix IndexedDB snapshot lock at ${lockPath}`, { cause: error });
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 100));
+    }
+  }
+
+  try {
+    return await fn();
+  } finally {
+    try {
+      rmSync(lockPath, { recursive: true, force: true });
+    } catch {}
+  }
+}
+
 function ensurePersistentIndexedDb(): void {
   if (typeof indexedDB !== "undefined") return;
 
   mkdirSync(MATRIX_INDEXEDDB_PATH, { recursive: true });
+  mkdirSync(dirname(MATRIX_INDEXEDDB_SNAPSHOT_PATH), { recursive: true });
 
-  const globalWithWindow = globalThis as typeof globalThis & { window: Window & typeof globalThis };
-  globalWithWindow.window = globalThis as Window & typeof globalThis;
-
-  setGlobalVars(globalThis, {
-    checkOrigin: false,
-    databaseBasePath: MATRIX_INDEXEDDB_PATH,
-    sysDatabaseBasePath: MATRIX_INDEXEDDB_PATH,
-  });
+  const globalRecord = globalThis as Record<string, unknown>;
+  globalRecord.window = globalThis;
+  globalRecord.self = globalThis;
+  globalThis.indexedDB = fakeIndexedDB;
+  globalThis.IDBFactory = IDBFactory;
+  globalThis.IDBKeyRange = IDBKeyRange;
+  globalThis.IDBDatabase = IDBDatabase;
+  globalThis.IDBObjectStore = IDBObjectStore;
+  globalThis.IDBIndex = IDBIndex;
+  globalThis.IDBCursor = IDBCursor;
+  globalThis.IDBCursorWithValue = IDBCursorWithValue;
+  globalThis.IDBTransaction = IDBTransaction;
+  globalThis.IDBRequest = IDBRequest;
+  globalThis.IDBOpenDBRequest = IDBOpenDBRequest;
+  globalThis.IDBVersionChangeEvent = IDBVersionChangeEvent;
 
   if (typeof indexedDB === "undefined") {
-    throw new Error(
-      "Failed to initialize indexedDB. Install a persistent IndexedDB-backed runtime or configure indexeddbshim correctly."
-    );
+    throw new Error("Failed to initialize fake-indexeddb runtime");
+  }
+}
+
+async function snapshotObjectStore(store: IDBObjectStore): Promise<MatrixObjectStoreSnapshot> {
+  const records = await requestToPromise(store.getAll());
+  const keys = await requestToPromise(store.getAllKeys());
+  const indexes = Array.from(store.indexNames).map((name) => {
+    const index = store.index(name);
+
+    return {
+      keyPath: index.keyPath,
+      multiEntry: index.multiEntry,
+      name,
+      unique: index.unique,
+    };
+  });
+
+  return {
+    autoIncrement: store.autoIncrement,
+    indexes,
+    keyPath: store.keyPath,
+    name: store.name,
+    records: records.map((value, index) => ({
+      key: keys[index],
+      value,
+    })),
+  };
+}
+
+async function buildIndexedDbSnapshot(): Promise<MatrixIndexedDbSnapshot> {
+  const databaseInfos = await indexedDB.databases();
+  const snapshots: MatrixDatabaseSnapshot[] = [];
+
+  for (const info of databaseInfos) {
+    if (!info.name) continue;
+    if (!info.name.startsWith(MATRIX_CRYPTO_DB_PREFIX)) continue;
+
+    const database = await openDatabase(info.name);
+    const objectStoreNames = Array.from(database.objectStoreNames);
+    const objectStores: MatrixObjectStoreSnapshot[] = [];
+
+    for (const storeName of objectStoreNames) {
+      const transaction = database.transaction(storeName, "readonly");
+      const store = transaction.objectStore(storeName);
+      objectStores.push(await snapshotObjectStore(store));
+      await transactionDone(transaction);
+    }
+
+    snapshots.push({
+      name: info.name,
+      objectStores,
+      version: info.version ?? database.version,
+    });
+
+    database.close();
+  }
+
+  return {
+    databases: snapshots,
+    savedAt: new Date().toISOString(),
+  };
+}
+
+async function restoreObjectStore(
+  database: IDBDatabase,
+  snapshot: MatrixObjectStoreSnapshot
+): Promise<void> {
+  const transaction = database.transaction(snapshot.name, "readwrite");
+  const store = transaction.objectStore(snapshot.name);
+
+  for (const record of snapshot.records) {
+    if (snapshot.keyPath === null) {
+      store.put(record.value, record.key as IDBValidKey);
+    } else {
+      store.put(record.value);
+    }
+  }
+
+  await transactionDone(transaction);
+}
+
+async function restoreIndexedDbSnapshot(): Promise<void> {
+  if (!existsSync(MATRIX_INDEXEDDB_SNAPSHOT_PATH)) return;
+
+  await withSnapshotLock(async () => {
+    if (!existsSync(MATRIX_INDEXEDDB_SNAPSHOT_PATH)) return;
+
+    const snapshot = deserialize(readFileSync(MATRIX_INDEXEDDB_SNAPSHOT_PATH)) as MatrixIndexedDbSnapshot;
+
+    for (const databaseSnapshot of snapshot.databases) {
+      const database = await openDatabase(databaseSnapshot.name, databaseSnapshot.version, (upgradeDatabase) => {
+        for (const storeSnapshot of databaseSnapshot.objectStores) {
+          const store = upgradeDatabase.createObjectStore(storeSnapshot.name, {
+            autoIncrement: storeSnapshot.autoIncrement,
+            keyPath: storeSnapshot.keyPath,
+          });
+
+          for (const index of storeSnapshot.indexes) {
+            if (!store.indexNames.contains(index.name)) {
+              store.createIndex(index.name, index.keyPath as string | string[], {
+                multiEntry: index.multiEntry,
+                unique: index.unique,
+              });
+            }
+          }
+        }
+      });
+
+      for (const storeSnapshot of databaseSnapshot.objectStores) {
+        await restoreObjectStore(database, storeSnapshot);
+      }
+
+      database.close();
+    }
+  });
+}
+
+async function persistIndexedDbSnapshot(reason: string): Promise<void> {
+  if (!MATRIX_USE_INDEXEDDB || snapshotPersistInFlight) return;
+  snapshotPersistInFlight = true;
+
+  try {
+    const snapshot = await buildIndexedDbSnapshot();
+
+    await withSnapshotLock(async () => {
+      const tempPath = `${MATRIX_INDEXEDDB_SNAPSHOT_PATH}.tmp`;
+      writeFileSync(tempPath, serialize(snapshot), {
+        mode: 0o600,
+      });
+      chmodSync(tempPath, 0o600);
+      renameSync(tempPath, MATRIX_INDEXEDDB_SNAPSHOT_PATH);
+      chmodSync(MATRIX_INDEXEDDB_SNAPSHOT_PATH, 0o600);
+    });
+
+    console.log(`Persisted Matrix IndexedDB snapshot (${reason}) to ${MATRIX_INDEXEDDB_SNAPSHOT_PATH}`);
+  } finally {
+    snapshotPersistInFlight = false;
+  }
+}
+
+function scheduleSnapshotPersistence(): void {
+  if (!MATRIX_USE_INDEXEDDB || snapshotPersistTimer) return;
+
+  snapshotPersistTimer = setInterval(() => {
+    void persistIndexedDbSnapshot("interval").catch((error) => {
+      console.error("Failed to persist Matrix IndexedDB snapshot:", error);
+    });
+  }, SNAPSHOT_WRITE_INTERVAL_MS);
+  snapshotPersistTimer.unref();
+}
+
+function stopSnapshotPersistence(): void {
+  if (!snapshotPersistTimer) return;
+  clearInterval(snapshotPersistTimer);
+  snapshotPersistTimer = undefined;
+}
+
+async function preparePersistentIndexedDb(): Promise<void> {
+  ensurePersistentIndexedDb();
+  await restoreIndexedDbSnapshot();
+}
+
+async function persistSnapshotOnShutdown(): Promise<void> {
+  stopSnapshotPersistence();
+
+  try {
+    await persistIndexedDbSnapshot("shutdown");
+  } catch (error) {
+    console.error("Failed to persist Matrix IndexedDB snapshot during shutdown:", error);
   }
 }
 
@@ -114,7 +404,7 @@ async function loadMatrixSdk(): Promise<RuntimeMatrixSdk> {
   if (matrixSdk) return matrixSdk;
 
   if (MATRIX_USE_INDEXEDDB) {
-    ensurePersistentIndexedDb();
+    await preparePersistentIndexedDb();
     matrixSdk = (await import("matrix-js-sdk/lib/browser-index.js")) as RuntimeMatrixSdk;
   } else {
     matrixSdk = (await import("matrix-js-sdk")) as RuntimeMatrixSdk;
@@ -227,7 +517,7 @@ Only extract what's explicitly there.`,
 }
 
 async function isAlreadyCaptured(eventId: string): Promise<boolean> {
-  const { data, error } = await supabase
+  const { data, error } = await getSupabaseClient()
     .from("thoughts")
     .select("id")
     .contains("metadata", { matrix_event_id: eventId })
@@ -265,7 +555,7 @@ async function captureMessage(event: MatrixEvent, room: MatrixRoom): Promise<voi
       extractMetadata(body),
     ]);
 
-    const { error } = await supabase.from("thoughts").insert({
+    const { error } = await getSupabaseClient().from("thoughts").insert({
       content: body,
       embedding,
       created_at: new Date(timestamp).toISOString(),
@@ -413,6 +703,11 @@ async function main(): Promise<void> {
     storagePassword: MATRIX_USE_INDEXEDDB ? MATRIX_CRYPTO_STORE_PASSWORD : undefined,
   });
 
+  if (MATRIX_USE_INDEXEDDB) {
+    await persistIndexedDbSnapshot("post-init");
+    scheduleSnapshotPersistence();
+  }
+
   const crypto = client.getCrypto();
   if (!crypto) {
     throw new Error("Matrix crypto failed to initialize");
@@ -483,6 +778,7 @@ async function main(): Promise<void> {
   const shutdown = async () => {
     console.log("Stopping Matrix capture service");
     client.stopClient();
+    await persistSnapshotOnShutdown();
     process.exit(0);
   };
 
