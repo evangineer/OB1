@@ -68,11 +68,13 @@ const MATRIX_SECRET_STORAGE_KEY = process.env.MATRIX_SECRET_STORAGE_KEY;
 const MATRIX_SECRET_STORAGE_KEY_BASE64 = process.env.MATRIX_SECRET_STORAGE_KEY_BASE64;
 const MATRIX_SECRET_STORAGE_PASSPHRASE = process.env.MATRIX_SECRET_STORAGE_PASSPHRASE;
 const SNAPSHOT_WRITE_INTERVAL_MS = 15_000;
+const ENCRYPTED_EVENT_RETRY_DELAYS_MS = [250, 1000, 3000, 7000, 15000];
 
 const ALLOWED_MSG_TYPES = new Set(["m.text", "m.notice"]);
 const seenEventIds = new Set<string>();
 const handledVerificationRequests = new Set<string>();
 const TIMELINE_DEBUG = (process.env.MATRIX_TIMELINE_DEBUG || "false") === "true";
+const pendingEncryptedEventRetries = new Map<string, NodeJS.Timeout>();
 
 type RuntimeMatrixSdk = Pick<
   typeof MatrixSdk,
@@ -131,6 +133,14 @@ function getSupabaseClient(): ReturnType<typeof createClient<Database>> {
 function debugTimeline(message: string, details: Record<string, unknown>): void {
   if (!TIMELINE_DEBUG) return;
   console.log(`[timeline] ${message} ${JSON.stringify(details)}`);
+}
+
+function clearEncryptedRetry(eventId: string | null | undefined): void {
+  if (!eventId) return;
+  const timer = pendingEncryptedEventRetries.get(eventId);
+  if (!timer) return;
+  clearTimeout(timer);
+  pendingEncryptedEventRetries.delete(eventId);
 }
 
 async function resolveDeviceId(): Promise<string> {
@@ -655,6 +665,7 @@ function queueCapture(event: MatrixEvent, room: MatrixRoom, toStartOfTimeline?: 
   }
 
   if (event.getType() === "m.room.message" && !event.isDecryptionFailure()) {
+    clearEncryptedRetry(event.getId());
     debugTimeline("queueCapture.capture_immediate", {
       eventId: event.getId(),
       roomId: room.roomId,
@@ -664,7 +675,54 @@ function queueCapture(event: MatrixEvent, room: MatrixRoom, toStartOfTimeline?: 
   }
 
   if (event.isEncrypted()) {
+    const eventId = event.getId();
+
+    const retryCapture = (attempt: number) => {
+      const currentEventId = event.getId();
+      if (!currentEventId) return;
+
+      if (event.getType() === "m.room.message" && !event.isDecryptionFailure()) {
+        clearEncryptedRetry(currentEventId);
+        debugTimeline("queueCapture.retry.capture", {
+          attempt,
+          eventId: currentEventId,
+          roomId: room.roomId,
+        });
+        void captureMessage(event, room);
+        return;
+      }
+
+      const delayMs = ENCRYPTED_EVENT_RETRY_DELAYS_MS[attempt];
+      if (delayMs === undefined) {
+        clearEncryptedRetry(currentEventId);
+        debugTimeline("queueCapture.retry.give_up", {
+          attempt,
+          decryptionFailure: event.isDecryptionFailure(),
+          eventId: currentEventId,
+          eventType: event.getType(),
+          roomId: room.roomId,
+        });
+        return;
+      }
+
+      debugTimeline("queueCapture.retry.schedule", {
+        attempt,
+        delayMs,
+        decryptionFailure: event.isDecryptionFailure(),
+        eventId: currentEventId,
+        eventType: event.getType(),
+        roomId: room.roomId,
+      });
+
+      const timer = setTimeout(() => {
+        pendingEncryptedEventRetries.delete(currentEventId);
+        retryCapture(attempt + 1);
+      }, delayMs);
+      pendingEncryptedEventRetries.set(currentEventId, timer);
+    };
+
     event.once(matrixSdk.MatrixEventEvent.Decrypted, () => {
+      clearEncryptedRetry(eventId);
       debugTimeline("queueCapture.decrypted", {
         decryptionFailure: event.isDecryptionFailure(),
         eventId: event.getId(),
@@ -677,6 +735,9 @@ function queueCapture(event: MatrixEvent, room: MatrixRoom, toStartOfTimeline?: 
       eventId: event.getId(),
       roomId: room.roomId,
     });
+    if (eventId && !pendingEncryptedEventRetries.has(eventId)) {
+      retryCapture(0);
+    }
   }
 }
 
