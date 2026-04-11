@@ -2,6 +2,10 @@
 
 > Capture messages from encrypted or unencrypted Matrix rooms into Open Brain using a long-running `matrix-js-sdk` service.
 
+## Third-Party Notice
+
+This directory carries a local third-party notice for any code copied from or materially adapted from OpenClaw's Matrix extension. See [`THIRD_PARTY_NOTICE.md`](./THIRD_PARTY_NOTICE.md).
+
 ## What It Does
 
 This integration runs a persistent Matrix client, enables Rust crypto through `matrix-js-sdk`, listens for room timeline events, and writes captured messages into the `thoughts` table with embeddings and extracted metadata.

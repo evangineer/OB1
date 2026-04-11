@@ -1,29 +1,13 @@
-import {
-  chmodSync,
-  existsSync,
-  mkdirSync,
-  readFileSync,
-  renameSync,
-  rmSync,
-  writeFileSync,
-} from "node:fs";
-import { dirname, join } from "node:path";
-import { deserialize, serialize } from "node:v8";
+/*
+ * Portions of the Matrix crypto persistence and decryption retry flow in this file
+ * are derived from or materially adapted from OpenClaw's Matrix extension:
+ * https://github.com/openclaw/openclaw/tree/main/extensions/matrix
+ *
+ * See THIRD_PARTY_NOTICE.md in this directory for attribution and license terms.
+ */
+
+import { join } from "node:path";
 import type * as MatrixSdk from "matrix-js-sdk";
-import {
-  IDBCursor,
-  IDBCursorWithValue,
-  IDBDatabase,
-  IDBFactory,
-  IDBIndex,
-  IDBKeyRange,
-  IDBObjectStore,
-  IDBOpenDBRequest,
-  IDBRequest,
-  IDBTransaction,
-  IDBVersionChangeEvent,
-  indexedDB as fakeIndexedDB,
-} from "fake-indexeddb";
 import { VerificationMethod } from "matrix-js-sdk/lib/types.js";
 import { decodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key.js";
 import { deriveRecoveryKeyFromPassphrase } from "matrix-js-sdk/lib/crypto-api/key-passphrase.js";
@@ -33,8 +17,10 @@ import {
   type ShowSasCallbacks,
   type VerificationRequest,
 } from "matrix-js-sdk/lib/crypto-api/verification.js";
-import { createClient } from "@supabase/supabase-js";
+import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { Database } from "./database.types.js";
+import { MatrixDecryptBridge } from "./decrypt-bridge.js";
+import { persistIdbToDisk, restoreIdbFromDisk } from "./idb-persistence.js";
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
@@ -63,19 +49,17 @@ const MATRIX_CRYPTO_DB_PREFIX = process.env.MATRIX_CRYPTO_DB_PREFIX || "ob1-matr
 const MATRIX_CRYPTO_STORE_PASSWORD = process.env.MATRIX_CRYPTO_STORE_PASSWORD;
 const MATRIX_INDEXEDDB_PATH = process.env.MATRIX_INDEXEDDB_PATH || "/data/indexeddb";
 const MATRIX_INDEXEDDB_SNAPSHOT_PATH =
-  process.env.MATRIX_INDEXEDDB_SNAPSHOT_PATH || join(MATRIX_INDEXEDDB_PATH, "crypto-idb-snapshot.bin");
+  process.env.MATRIX_INDEXEDDB_SNAPSHOT_PATH || join(MATRIX_INDEXEDDB_PATH, "crypto-idb-snapshot.json");
 const MATRIX_USE_INDEXEDDB = (process.env.MATRIX_USE_INDEXEDDB || "false") === "true";
 const MATRIX_SECRET_STORAGE_KEY = process.env.MATRIX_SECRET_STORAGE_KEY;
 const MATRIX_SECRET_STORAGE_KEY_BASE64 = process.env.MATRIX_SECRET_STORAGE_KEY_BASE64;
 const MATRIX_SECRET_STORAGE_PASSPHRASE = process.env.MATRIX_SECRET_STORAGE_PASSPHRASE;
-const SNAPSHOT_WRITE_INTERVAL_MS = 15_000;
-const ENCRYPTED_EVENT_RETRY_DELAYS_MS = [250, 1000, 3000, 7000, 15000];
+const SNAPSHOT_WRITE_INTERVAL_MS = 60_000;
 
 const ALLOWED_MSG_TYPES = new Set(["m.text", "m.notice"]);
 const seenEventIds = new Set<string>();
 const handledVerificationRequests = new Set<string>();
 const TIMELINE_DEBUG = (process.env.MATRIX_TIMELINE_DEBUG || "false") === "true";
-const pendingEncryptedEventRetries = new Map<string, NodeJS.Timeout>();
 
 type RuntimeMatrixSdk = Pick<
   typeof MatrixSdk,
@@ -87,33 +71,10 @@ type RuntimeMatrixSdk = Pick<
   | "createClient"
 >;
 let matrixSdk: RuntimeMatrixSdk;
-let supabase: ReturnType<typeof createClient<Database>> | undefined;
+let supabase: SupabaseClient<Database> | undefined;
 
 type MatrixEvent = MatrixSdk.MatrixEvent;
 type MatrixRoom = MatrixSdk.Room;
-type MatrixIndexMetadata = {
-  keyPath: string | string[] | null;
-  multiEntry: boolean;
-  name: string;
-  unique: boolean;
-};
-type MatrixObjectStoreSnapshot = {
-  autoIncrement: boolean;
-  indexes: MatrixIndexMetadata[];
-  keyPath: string | string[] | null;
-  name: string;
-  records: Array<{ key: unknown; value: unknown }>;
-};
-type MatrixDatabaseSnapshot = {
-  name: string;
-  objectStores: MatrixObjectStoreSnapshot[];
-  version: number;
-};
-type MatrixIndexedDbSnapshot = {
-  databases: MatrixDatabaseSnapshot[];
-  savedAt: string;
-};
-
 let snapshotPersistTimer: NodeJS.Timeout | undefined;
 let snapshotPersistInFlight = false;
 
@@ -121,15 +82,18 @@ function requireEnv(name: string, value: string | undefined): void {
   if (!value) throw new Error(`Missing required environment variable: ${name}`);
 }
 
-function getSupabaseClient(): ReturnType<typeof createClient<Database>> {
+function getSupabaseClient(): SupabaseClient<Database> {
   if (!supabase) {
     requireEnv("SUPABASE_URL", SUPABASE_URL);
     requireEnv("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_ROLE_KEY);
+    // The deployment chooses the exposed tenant schema at runtime. The checked-in
+    // placeholder types only model the `thoughts` table shape, so we intentionally
+    // cast the dynamic schema selection here.
     supabase = createClient<Database>(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
       db: {
-        schema: SUPABASE_SCHEMA,
+        schema: SUPABASE_SCHEMA as "public",
       },
-    });
+    }) as SupabaseClient<Database>;
   }
 
   return supabase;
@@ -138,14 +102,6 @@ function getSupabaseClient(): ReturnType<typeof createClient<Database>> {
 function debugTimeline(message: string, details: Record<string, unknown>): void {
   if (!TIMELINE_DEBUG) return;
   console.log(`[timeline] ${message} ${JSON.stringify(details)}`);
-}
-
-function clearEncryptedRetry(eventId: string | null | undefined): void {
-  if (!eventId) return;
-  const timer = pendingEncryptedEventRetries.get(eventId);
-  if (!timer) return;
-  clearTimeout(timer);
-  pendingEncryptedEventRetries.delete(eventId);
 }
 
 async function resolveDeviceId(): Promise<string> {
@@ -172,218 +128,15 @@ async function resolveDeviceId(): Promise<string> {
   return body.device_id;
 }
 
-async function requestToPromise<T>(request: IDBRequest<T>): Promise<T> {
-  return await new Promise<T>((resolve, reject) => {
-    request.onsuccess = () => resolve(request.result);
-    request.onerror = () => reject(request.error ?? new Error("IndexedDB request failed"));
-  });
-}
-
-async function transactionDone(transaction: IDBTransaction): Promise<void> {
-  await new Promise<void>((resolve, reject) => {
-    transaction.oncomplete = () => resolve();
-    transaction.onerror = () => reject(transaction.error ?? new Error("IndexedDB transaction failed"));
-    transaction.onabort = () => reject(transaction.error ?? new Error("IndexedDB transaction aborted"));
-  });
-}
-
-async function openDatabase(name: string, version?: number, onUpgrade?: (database: IDBDatabase) => void): Promise<IDBDatabase> {
-  const request = version === undefined ? indexedDB.open(name) : indexedDB.open(name, version);
-
-  if (onUpgrade) {
-    request.onupgradeneeded = () => {
-      onUpgrade(request.result);
-    };
-  }
-
-  return await requestToPromise(request);
-}
-
-async function withSnapshotLock<T>(fn: () => Promise<T>): Promise<T> {
-  const lockPath = `${MATRIX_INDEXEDDB_SNAPSHOT_PATH}.lock`;
-  const deadline = Date.now() + 10_000;
-
-  while (true) {
-    try {
-      mkdirSync(lockPath, { mode: 0o700 });
-      break;
-    } catch (error) {
-      if (Date.now() >= deadline) {
-        throw new Error(`Timed out waiting for Matrix IndexedDB snapshot lock at ${lockPath}`, { cause: error });
-      }
-
-      await new Promise((resolve) => setTimeout(resolve, 100));
-    }
-  }
-
-  try {
-    return await fn();
-  } finally {
-    try {
-      rmSync(lockPath, { recursive: true, force: true });
-    } catch {}
-  }
-}
-
-function ensurePersistentIndexedDb(): void {
-  if (typeof indexedDB !== "undefined") return;
-
-  mkdirSync(MATRIX_INDEXEDDB_PATH, { recursive: true });
-  mkdirSync(dirname(MATRIX_INDEXEDDB_SNAPSHOT_PATH), { recursive: true });
-
-  const globalRecord = globalThis as Record<string, unknown>;
-  globalRecord.window = globalThis;
-  globalRecord.self = globalThis;
-  globalThis.indexedDB = fakeIndexedDB;
-  globalThis.IDBFactory = IDBFactory;
-  globalThis.IDBKeyRange = IDBKeyRange;
-  globalThis.IDBDatabase = IDBDatabase;
-  globalThis.IDBObjectStore = IDBObjectStore;
-  globalThis.IDBIndex = IDBIndex;
-  globalThis.IDBCursor = IDBCursor;
-  globalThis.IDBCursorWithValue = IDBCursorWithValue;
-  globalThis.IDBTransaction = IDBTransaction;
-  globalThis.IDBRequest = IDBRequest;
-  globalThis.IDBOpenDBRequest = IDBOpenDBRequest;
-  globalThis.IDBVersionChangeEvent = IDBVersionChangeEvent;
-
-  if (typeof indexedDB === "undefined") {
-    throw new Error("Failed to initialize fake-indexeddb runtime");
-  }
-}
-
-async function snapshotObjectStore(store: IDBObjectStore): Promise<MatrixObjectStoreSnapshot> {
-  const records = await requestToPromise(store.getAll());
-  const keys = await requestToPromise(store.getAllKeys());
-  const indexes = Array.from(store.indexNames).map((name) => {
-    const index = store.index(name);
-
-    return {
-      keyPath: index.keyPath,
-      multiEntry: index.multiEntry,
-      name,
-      unique: index.unique,
-    };
-  });
-
-  return {
-    autoIncrement: store.autoIncrement,
-    indexes,
-    keyPath: store.keyPath,
-    name: store.name,
-    records: records.map((value, index) => ({
-      key: keys[index],
-      value,
-    })),
-  };
-}
-
-async function buildIndexedDbSnapshot(): Promise<MatrixIndexedDbSnapshot> {
-  const databaseInfos = await indexedDB.databases();
-  const snapshots: MatrixDatabaseSnapshot[] = [];
-
-  for (const info of databaseInfos) {
-    if (!info.name) continue;
-    if (!info.name.startsWith(MATRIX_CRYPTO_DB_PREFIX)) continue;
-
-    const database = await openDatabase(info.name);
-    const objectStoreNames = Array.from(database.objectStoreNames);
-    const objectStores: MatrixObjectStoreSnapshot[] = [];
-
-    for (const storeName of objectStoreNames) {
-      const transaction = database.transaction(storeName, "readonly");
-      const store = transaction.objectStore(storeName);
-      objectStores.push(await snapshotObjectStore(store));
-      await transactionDone(transaction);
-    }
-
-    snapshots.push({
-      name: info.name,
-      objectStores,
-      version: info.version ?? database.version,
-    });
-
-    database.close();
-  }
-
-  return {
-    databases: snapshots,
-    savedAt: new Date().toISOString(),
-  };
-}
-
-async function restoreObjectStore(
-  database: IDBDatabase,
-  snapshot: MatrixObjectStoreSnapshot
-): Promise<void> {
-  const transaction = database.transaction(snapshot.name, "readwrite");
-  const store = transaction.objectStore(snapshot.name);
-
-  for (const record of snapshot.records) {
-    if (snapshot.keyPath === null) {
-      store.put(record.value, record.key as IDBValidKey);
-    } else {
-      store.put(record.value);
-    }
-  }
-
-  await transactionDone(transaction);
-}
-
-async function restoreIndexedDbSnapshot(): Promise<void> {
-  if (!existsSync(MATRIX_INDEXEDDB_SNAPSHOT_PATH)) return;
-
-  await withSnapshotLock(async () => {
-    if (!existsSync(MATRIX_INDEXEDDB_SNAPSHOT_PATH)) return;
-
-    const snapshot = deserialize(readFileSync(MATRIX_INDEXEDDB_SNAPSHOT_PATH)) as MatrixIndexedDbSnapshot;
-
-    for (const databaseSnapshot of snapshot.databases) {
-      const database = await openDatabase(databaseSnapshot.name, databaseSnapshot.version, (upgradeDatabase) => {
-        for (const storeSnapshot of databaseSnapshot.objectStores) {
-          const store = upgradeDatabase.createObjectStore(storeSnapshot.name, {
-            autoIncrement: storeSnapshot.autoIncrement,
-            keyPath: storeSnapshot.keyPath,
-          });
-
-          for (const index of storeSnapshot.indexes) {
-            if (!store.indexNames.contains(index.name)) {
-              store.createIndex(index.name, index.keyPath as string | string[], {
-                multiEntry: index.multiEntry,
-                unique: index.unique,
-              });
-            }
-          }
-        }
-      });
-
-      for (const storeSnapshot of databaseSnapshot.objectStores) {
-        await restoreObjectStore(database, storeSnapshot);
-      }
-
-      database.close();
-    }
-  });
-}
-
 async function persistIndexedDbSnapshot(reason: string): Promise<void> {
   if (!MATRIX_USE_INDEXEDDB || snapshotPersistInFlight) return;
   snapshotPersistInFlight = true;
 
   try {
-    const snapshot = await buildIndexedDbSnapshot();
-
-    await withSnapshotLock(async () => {
-      const tempPath = `${MATRIX_INDEXEDDB_SNAPSHOT_PATH}.tmp`;
-      writeFileSync(tempPath, serialize(snapshot), {
-        mode: 0o600,
-      });
-      chmodSync(tempPath, 0o600);
-      renameSync(tempPath, MATRIX_INDEXEDDB_SNAPSHOT_PATH);
-      chmodSync(MATRIX_INDEXEDDB_SNAPSHOT_PATH, 0o600);
+    await persistIdbToDisk({
+      snapshotPath: MATRIX_INDEXEDDB_SNAPSHOT_PATH,
     });
-
-    console.log(`Persisted Matrix IndexedDB snapshot (${reason}) to ${MATRIX_INDEXEDDB_SNAPSHOT_PATH}`);
+    console.log(`Persisted Matrix IndexedDB snapshot (${reason})`);
   } finally {
     snapshotPersistInFlight = false;
   }
@@ -407,8 +160,7 @@ function stopSnapshotPersistence(): void {
 }
 
 async function preparePersistentIndexedDb(): Promise<void> {
-  ensurePersistentIndexedDb();
-  await restoreIndexedDbSnapshot();
+  await restoreIdbFromDisk(MATRIX_INDEXEDDB_SNAPSHOT_PATH);
 }
 
 async function persistSnapshotOnShutdown(): Promise<void> {
@@ -670,7 +422,6 @@ function queueCapture(event: MatrixEvent, room: MatrixRoom, toStartOfTimeline?: 
   }
 
   if (event.getType() === "m.room.message" && !event.isDecryptionFailure()) {
-    clearEncryptedRetry(event.getId());
     debugTimeline("queueCapture.capture_immediate", {
       eventId: event.getId(),
       roomId: room.roomId,
@@ -679,71 +430,6 @@ function queueCapture(event: MatrixEvent, room: MatrixRoom, toStartOfTimeline?: 
     return;
   }
 
-  if (event.isEncrypted()) {
-    const eventId = event.getId();
-
-    const retryCapture = (attempt: number) => {
-      const currentEventId = event.getId();
-      if (!currentEventId) return;
-
-      if (event.getType() === "m.room.message" && !event.isDecryptionFailure()) {
-        clearEncryptedRetry(currentEventId);
-        debugTimeline("queueCapture.retry.capture", {
-          attempt,
-          eventId: currentEventId,
-          roomId: room.roomId,
-        });
-        void captureMessage(event, room);
-        return;
-      }
-
-      const delayMs = ENCRYPTED_EVENT_RETRY_DELAYS_MS[attempt];
-      if (delayMs === undefined) {
-        clearEncryptedRetry(currentEventId);
-        debugTimeline("queueCapture.retry.give_up", {
-          attempt,
-          decryptionFailure: event.isDecryptionFailure(),
-          eventId: currentEventId,
-          eventType: event.getType(),
-          roomId: room.roomId,
-        });
-        return;
-      }
-
-      debugTimeline("queueCapture.retry.schedule", {
-        attempt,
-        delayMs,
-        decryptionFailure: event.isDecryptionFailure(),
-        eventId: currentEventId,
-        eventType: event.getType(),
-        roomId: room.roomId,
-      });
-
-      const timer = setTimeout(() => {
-        pendingEncryptedEventRetries.delete(currentEventId);
-        retryCapture(attempt + 1);
-      }, delayMs);
-      pendingEncryptedEventRetries.set(currentEventId, timer);
-    };
-
-    event.once(matrixSdk.MatrixEventEvent.Decrypted, () => {
-      clearEncryptedRetry(eventId);
-      debugTimeline("queueCapture.decrypted", {
-        decryptionFailure: event.isDecryptionFailure(),
-        eventId: event.getId(),
-        eventType: event.getType(),
-        roomId: room.roomId,
-      });
-      void captureMessage(event, room);
-    });
-    debugTimeline("queueCapture.await_decrypt", {
-      eventId: event.getId(),
-      roomId: room.roomId,
-    });
-    if (eventId && !pendingEncryptedEventRetries.has(eventId)) {
-      retryCapture(0);
-    }
-  }
 }
 
 function formatSas(sas: GeneratedSas): string {
@@ -861,6 +547,43 @@ async function main(): Promise<void> {
     throw new Error("Matrix crypto failed to initialize");
   }
 
+  const decryptBridge = new MatrixDecryptBridge({
+    client,
+    emitDecryptedEvent: (roomId, event) => {
+      debugTimeline("queueCapture.decrypted", {
+        decryptionFailure: event.isDecryptionFailure(),
+        eventId: event.getId(),
+        eventType: event.getType(),
+        roomId,
+      });
+    },
+    emitMessage: (roomId, event) => {
+      const room = client.getRoom(roomId);
+      if (!room) {
+        debugTimeline("captureMessage.skip.missing_room", {
+          eventId: event.getId(),
+          roomId,
+        });
+        return;
+      }
+      debugTimeline("queueCapture.retry.capture", {
+        eventId: event.getId(),
+        roomId,
+      });
+      void captureMessage(event, room);
+    },
+    emitFailedDecryption: (roomId, event, error) => {
+      debugTimeline("queueCapture.retry.failed_decryption", {
+        error: String(error),
+        eventId: event.getId(),
+        roomId,
+      });
+    },
+  });
+  decryptBridge.bindCryptoRetrySignals(
+    crypto as unknown as { on: (eventName: string, listener: (...args: unknown[]) => void) => void },
+  );
+
   try {
     await crypto.bootstrapCrossSigning({});
     console.log("Cross-signing bootstrap complete");
@@ -901,7 +624,25 @@ async function main(): Promise<void> {
 
   client.on(sdk.RoomEvent.Timeline, (event, room, toStartOfTimeline) => {
     if (!room) return;
-    queueCapture(event, room, toStartOfTimeline);
+    if (toStartOfTimeline) {
+      queueCapture(event, room, toStartOfTimeline);
+      return;
+    }
+    if (event.isEncrypted()) {
+      debugTimeline("queueCapture.await_decrypt", {
+        eventId: event.getId(),
+        roomId: room.roomId,
+      });
+      decryptBridge.attachEncryptedEvent(event, room.roomId);
+      return;
+    }
+    if (
+      event.getType() === "m.room.message" &&
+      !event.isDecryptionFailure() &&
+      decryptBridge.shouldEmitUnencryptedMessage(room.roomId, event.getId() || "")
+    ) {
+      queueCapture(event, room, toStartOfTimeline);
+    }
   });
 
   (
@@ -926,6 +667,8 @@ async function main(): Promise<void> {
   const shutdown = async () => {
     console.log("Stopping Matrix capture service");
     client.stopClient();
+    decryptBridge.stop();
+    await decryptBridge.drainPendingDecryptions("matrix capture shutdown");
     await persistSnapshotOnShutdown();
     process.exit(0);
   };
