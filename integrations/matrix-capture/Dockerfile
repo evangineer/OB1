@@ -21,6 +21,9 @@ COPY package.json ./
 RUN npm install
 
 COPY service.ts ./
+COPY decrypt-bridge.ts ./
+COPY idb-persistence.ts ./
+COPY database.types.ts ./
 
 RUN mkdir -p /data/indexeddb
 
