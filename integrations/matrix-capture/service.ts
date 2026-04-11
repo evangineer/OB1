@@ -572,8 +572,8 @@ async function captureMessage(event: MatrixEvent, room: MatrixRoom): Promise<voi
     debugTimeline("captureMessage.skip.unwatched_room", { eventId, roomId });
     return;
   }
-  if (sender === MATRIX_USER_ID) {
-    debugTimeline("captureMessage.skip.self", { eventId, sender });
+  if (sender !== MATRIX_USER_ID) {
+    debugTimeline("captureMessage.skip.other_sender", { eventId, sender });
     return;
   }
   if (!ALLOWED_MSG_TYPES.has(msgtype)) {
