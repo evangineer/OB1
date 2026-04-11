@@ -7,7 +7,7 @@
  */
 
 import { CryptoEvent } from "matrix-js-sdk/lib/crypto-api/CryptoEvent.js";
-import { MatrixEventEvent, type MatrixEvent } from "matrix-js-sdk";
+import { MatrixEventEvent, type MatrixEvent } from "matrix-js-sdk/lib/matrix.js";
 
 type MatrixDecryptIfNeededClient = {
   decryptEventIfNeeded?: (
