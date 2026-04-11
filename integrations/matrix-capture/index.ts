@@ -6,6 +6,7 @@ import type { Database } from "./database.types.ts";
 
 const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+const SUPABASE_SCHEMA = Deno.env.get("SUPABASE_SCHEMA") || "public";
 const OPENROUTER_API_KEY = Deno.env.get("OPENROUTER_API_KEY")!;
 const MATRIX_HOMESERVER_URL = Deno.env.get("MATRIX_HOMESERVER_URL")!;
 const MATRIX_ACCESS_TOKEN = Deno.env.get("MATRIX_ACCESS_TOKEN")!;
@@ -37,7 +38,11 @@ const MATRIX_MAX_EVENT_AGE_MS = Number.parseInt(
 );
 const ALLOWED_MSG_TYPES = new Set(["m.text", "m.notice"]);
 
-const supabase = createClient<Database>(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+const supabase = createClient<Database>(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+  db: {
+    schema: SUPABASE_SCHEMA,
+  },
+});
 
 type MatrixEventLike = {
   getId?: () => string | undefined;

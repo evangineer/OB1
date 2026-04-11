@@ -38,6 +38,7 @@ import type { Database } from "./database.types.js";
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+const SUPABASE_SCHEMA = process.env.SUPABASE_SCHEMA || "public";
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY!;
 const MATRIX_HOMESERVER_URL = process.env.MATRIX_HOMESERVER_URL!;
 const MATRIX_ACCESS_TOKEN = process.env.MATRIX_ACCESS_TOKEN!;
@@ -124,7 +125,11 @@ function getSupabaseClient(): ReturnType<typeof createClient<Database>> {
   if (!supabase) {
     requireEnv("SUPABASE_URL", SUPABASE_URL);
     requireEnv("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_ROLE_KEY);
-    supabase = createClient<Database>(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+    supabase = createClient<Database>(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
+      db: {
+        schema: SUPABASE_SCHEMA,
+      },
+    });
   }
 
   return supabase;

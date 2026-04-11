@@ -183,6 +183,7 @@ Set the environment variables your service needs:
 
 - `SUPABASE_URL`
 - `SUPABASE_SERVICE_ROLE_KEY`
+- Optional: `SUPABASE_SCHEMA` if the target API surface exposes `thoughts` outside `public`
 - `OPENROUTER_API_KEY`
 - `MATRIX_HOMESERVER_URL`
 - `MATRIX_ACCESS_TOKEN`
@@ -200,6 +201,7 @@ Example:
 ```bash
 export SUPABASE_URL=https://YOUR_PROJECT.supabase.co
 export SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
+export SUPABASE_SCHEMA=public
 export OPENROUTER_API_KEY=your-openrouter-key
 export MATRIX_HOMESERVER_URL=https://matrix.example.com
 export MATRIX_ACCESS_TOKEN=your-matrix-access-token
