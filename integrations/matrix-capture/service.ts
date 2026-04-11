@@ -72,6 +72,7 @@ const SNAPSHOT_WRITE_INTERVAL_MS = 15_000;
 const ALLOWED_MSG_TYPES = new Set(["m.text", "m.notice"]);
 const seenEventIds = new Set<string>();
 const handledVerificationRequests = new Set<string>();
+const TIMELINE_DEBUG = (process.env.MATRIX_TIMELINE_DEBUG || "false") === "true";
 
 type RuntimeMatrixSdk = Pick<
   typeof MatrixSdk,
@@ -125,6 +126,11 @@ function getSupabaseClient(): ReturnType<typeof createClient<Database>> {
   }
 
   return supabase;
+}
+
+function debugTimeline(message: string, details: Record<string, unknown>): void {
+  if (!TIMELINE_DEBUG) return;
+  console.log(`[timeline] ${message} ${JSON.stringify(details)}`);
 }
 
 async function resolveDeviceId(): Promise<string> {
@@ -537,23 +543,68 @@ async function captureMessage(event: MatrixEvent, room: MatrixRoom): Promise<voi
   const msgtype = typeof content.msgtype === "string" ? content.msgtype : "m.text";
   const timestamp = event.getTs();
 
-  if (!eventId || !sender || !roomId || !timestamp) return;
-  if (!shouldWatchRoom(roomId)) return;
-  if (sender === MATRIX_USER_ID) return;
-  if (!ALLOWED_MSG_TYPES.has(msgtype)) return;
-  if (!body) return;
-  if (Date.now() - timestamp > MATRIX_MAX_EVENT_AGE_MS) return;
+  debugTimeline("captureMessage.enter", {
+    bodyLength: body.length,
+    encrypted: event.isEncrypted(),
+    eventId,
+    eventType: event.getType(),
+    msgtype,
+    roomId,
+    sender,
+    timestamp,
+  });
 
-  if (seenEventIds.has(eventId)) return;
+  if (!eventId || !sender || !roomId || !timestamp) {
+    debugTimeline("captureMessage.skip.missing", { eventId, roomId, sender, timestamp });
+    return;
+  }
+  if (!shouldWatchRoom(roomId)) {
+    debugTimeline("captureMessage.skip.unwatched_room", { eventId, roomId });
+    return;
+  }
+  if (sender === MATRIX_USER_ID) {
+    debugTimeline("captureMessage.skip.self", { eventId, sender });
+    return;
+  }
+  if (!ALLOWED_MSG_TYPES.has(msgtype)) {
+    debugTimeline("captureMessage.skip.msgtype", { eventId, msgtype });
+    return;
+  }
+  if (!body) {
+    debugTimeline("captureMessage.skip.empty_body", { eventId, msgtype });
+    return;
+  }
+  if (Date.now() - timestamp > MATRIX_MAX_EVENT_AGE_MS) {
+    debugTimeline("captureMessage.skip.old", {
+      ageMs: Date.now() - timestamp,
+      eventId,
+      maxAgeMs: MATRIX_MAX_EVENT_AGE_MS,
+    });
+    return;
+  }
+
+  if (seenEventIds.has(eventId)) {
+    debugTimeline("captureMessage.skip.seen", { eventId });
+    return;
+  }
   seenEventIds.add(eventId);
 
   try {
-    if (await isAlreadyCaptured(eventId)) return;
+    if (await isAlreadyCaptured(eventId)) {
+      debugTimeline("captureMessage.skip.already_captured", { eventId });
+      return;
+    }
 
     const [embedding, metadata] = await Promise.all([
       getEmbedding(body),
       extractMetadata(body),
     ]);
+
+    debugTimeline("captureMessage.insert.start", {
+      eventId,
+      metadataType: metadata?.type,
+      topics: Array.isArray(metadata?.topics) ? metadata.topics : [],
+    });
 
     const { error } = await getSupabaseClient().from("thoughts").insert({
       content: body,
@@ -576,6 +627,7 @@ async function captureMessage(event: MatrixEvent, room: MatrixRoom): Promise<voi
 
     if (error) throw new Error(error.message);
 
+    debugTimeline("captureMessage.insert.success", { eventId, roomId });
     console.log(`Captured ${eventId} from ${room.name || roomId}`);
   } catch (error) {
     console.error(`Failed to capture ${eventId}:`, error);
@@ -584,16 +636,46 @@ async function captureMessage(event: MatrixEvent, room: MatrixRoom): Promise<voi
 }
 
 function queueCapture(event: MatrixEvent, room: MatrixRoom, toStartOfTimeline?: boolean): void {
-  if (toStartOfTimeline) return;
+  debugTimeline("queueCapture.event", {
+    decryptedFailure: event.isDecryptionFailure(),
+    encrypted: event.isEncrypted(),
+    eventId: event.getId(),
+    eventType: event.getType(),
+    roomId: room.roomId,
+    sender: event.getSender(),
+    toStartOfTimeline: Boolean(toStartOfTimeline),
+  });
+
+  if (toStartOfTimeline) {
+    debugTimeline("queueCapture.skip.backfill", {
+      eventId: event.getId(),
+      roomId: room.roomId,
+    });
+    return;
+  }
 
   if (event.getType() === "m.room.message" && !event.isDecryptionFailure()) {
+    debugTimeline("queueCapture.capture_immediate", {
+      eventId: event.getId(),
+      roomId: room.roomId,
+    });
     void captureMessage(event, room);
     return;
   }
 
   if (event.isEncrypted()) {
     event.once(matrixSdk.MatrixEventEvent.Decrypted, () => {
+      debugTimeline("queueCapture.decrypted", {
+        decryptionFailure: event.isDecryptionFailure(),
+        eventId: event.getId(),
+        eventType: event.getType(),
+        roomId: room.roomId,
+      });
       void captureMessage(event, room);
+    });
+    debugTimeline("queueCapture.await_decrypt", {
+      eventId: event.getId(),
+      roomId: room.roomId,
     });
   }
 }
