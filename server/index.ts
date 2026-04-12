@@ -10,11 +10,11 @@ const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
 const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
 const OPENROUTER_API_KEY = Deno.env.get("OPENROUTER_API_KEY")!;
 const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY")!;
-const SUPABASE_SCHEMA = Deno.env.get("SUPABASE_SCHEMA") || "public";
+const OB1_SCHEMA = Deno.env.get("OB1_SCHEMA") || "public";
 
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
-const tenantDb = supabase.schema(SUPABASE_SCHEMA);
+const tenantDb = supabase.schema(OB1_SCHEMA);
 
 async function getEmbedding(text: string): Promise<number[]> {
   const r = await fetch(`${OPENROUTER_BASE}/embeddings`, {
