@@ -209,12 +209,27 @@ async function installRustCryptoDiagnostics(): Promise<void> {
       uiaCallback?: unknown
     ): Promise<void> {
       const request = msg as {
-        body?: Record<string, unknown>;
+        body?: string | Record<string, unknown>;
         constructor?: { name?: string };
         id?: string;
         type?: number | string;
       };
-      const body = request.body;
+      const parsedBody =
+        typeof request.body === "string"
+          ? (() => {
+              try {
+                return JSON.parse(request.body) as Record<string, unknown>;
+              } catch (error) {
+                console.warn("Matrix crypto debug: failed to parse keys/upload body", {
+                  error,
+                  id: request.id,
+                  type: request.type,
+                });
+                return undefined;
+              }
+            })()
+          : request.body;
+      const body = parsedBody;
       const oneTimeKeys =
         body && typeof body === "object" && "one_time_keys" in body
           ? (body.one_time_keys as Record<string, unknown>)
@@ -225,13 +240,26 @@ async function installRustCryptoDiagnostics(): Promise<void> {
           : undefined;
 
       if (request.constructor?.name === "KeysUploadRequest" || request.type === 0 || oneTimeKeys) {
+        const deviceKeys =
+          body && typeof body === "object" && "device_keys" in body
+            ? (body.device_keys as Record<string, unknown>)
+            : undefined;
         console.log(
           `Matrix crypto debug: outgoing keys/upload request=${JSON.stringify({
+            deviceKeyAlgorithms:
+              deviceKeys && typeof deviceKeys === "object" && "algorithms" in deviceKeys
+                ? (deviceKeys.algorithms as unknown[])
+                : [],
+            deviceKeyCount:
+              deviceKeys && typeof deviceKeys === "object" && "keys" in deviceKeys
+                ? Object.keys((deviceKeys.keys as Record<string, unknown>) || {}).length
+                : 0,
             fallbackKeyCount: fallbackKeys ? Object.keys(fallbackKeys).length : 0,
             fallbackKeys: fallbackKeys ? Object.keys(fallbackKeys) : [],
             id: request.id,
             oneTimeKeyCount: oneTimeKeys ? Object.keys(oneTimeKeys).length : 0,
             oneTimeKeys: oneTimeKeys ? Object.keys(oneTimeKeys) : [],
+            rawBody: typeof request.body === "string" ? request.body : JSON.stringify(request.body ?? {}),
             type: request.type,
           })}`
         );
