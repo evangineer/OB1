@@ -16,6 +16,13 @@ const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
 const tenantDb = supabase.schema(OB1_SCHEMA);
 
+type ThoughtSearchResult = {
+  content: string;
+  metadata: Record<string, unknown>;
+  similarity: number;
+  created_at: string;
+};
+
 async function getEmbedding(text: string): Promise<number[]> {
   const r = await fetch(`${OPENROUTER_BASE}/embeddings`, {
     method: "POST",
@@ -69,6 +76,50 @@ Only extract what's explicitly there.`,
   }
 }
 
+function formatThoughtResults(results: ThoughtSearchResult[]): string {
+  return results
+    .map((t, i) => {
+      const m = t.metadata || {};
+      const parts = [
+        `--- Result ${i + 1} (${(t.similarity * 100).toFixed(1)}% match) ---`,
+        `Captured: ${new Date(t.created_at).toLocaleDateString()}`,
+        `Type: ${m.type || "unknown"}`,
+      ];
+      if (Array.isArray(m.topics) && m.topics.length) {
+        parts.push(`Topics: ${(m.topics as string[]).join(", ")}`);
+      }
+      if (Array.isArray(m.people) && m.people.length) {
+        parts.push(`People: ${(m.people as string[]).join(", ")}`);
+      }
+      if (Array.isArray(m.action_items) && m.action_items.length) {
+        parts.push(`Actions: ${(m.action_items as string[]).join("; ")}`);
+      }
+      parts.push(`\n${t.content}`);
+      return parts.join("\n");
+    })
+    .join("\n\n");
+}
+
+async function searchThoughtsByContent(query: string, limit: number): Promise<ThoughtSearchResult[]> {
+  const { data, error } = await tenantDb
+    .from("thoughts")
+    .select("content, metadata, created_at")
+    .ilike("content", `%${query}%`)
+    .order("created_at", { ascending: false })
+    .limit(limit);
+
+  if (error) {
+    throw error;
+  }
+
+  return (data ?? []).map((t) => ({
+    content: t.content,
+    metadata: (t.metadata ?? {}) as Record<string, unknown>,
+    created_at: t.created_at,
+    similarity: 1,
+  }));
+}
+
 // --- MCP Server Setup ---
 
 const server = new McpServer({
@@ -106,44 +157,23 @@ server.registerTool(
         };
       }
 
-      if (!data || data.length === 0) {
+      let results = (data ?? []) as ThoughtSearchResult[];
+
+      if (results.length === 0) {
+        results = await searchThoughtsByContent(query, limit);
+      }
+
+      if (results.length === 0) {
         return {
           content: [{ type: "text" as const, text: `No thoughts found matching "${query}".` }],
         };
       }
 
-      const results = data.map(
-        (
-          t: {
-            content: string;
-            metadata: Record<string, unknown>;
-            similarity: number;
-            created_at: string;
-          },
-          i: number
-        ) => {
-          const m = t.metadata || {};
-          const parts = [
-            `--- Result ${i + 1} (${(t.similarity * 100).toFixed(1)}% match) ---`,
-            `Captured: ${new Date(t.created_at).toLocaleDateString()}`,
-            `Type: ${m.type || "unknown"}`,
-          ];
-          if (Array.isArray(m.topics) && m.topics.length)
-            parts.push(`Topics: ${(m.topics as string[]).join(", ")}`);
-          if (Array.isArray(m.people) && m.people.length)
-            parts.push(`People: ${(m.people as string[]).join(", ")}`);
-          if (Array.isArray(m.action_items) && m.action_items.length)
-            parts.push(`Actions: ${(m.action_items as string[]).join("; ")}`);
-          parts.push(`\n${t.content}`);
-          return parts.join("\n");
-        }
-      );
-
       return {
         content: [
           {
             type: "text" as const,
-            text: `Found ${data.length} thought(s):\n\n${results.join("\n\n")}`,
+            text: `Found ${results.length} thought(s):\n\n${formatThoughtResults(results)}`,
           },
         ],
       };
