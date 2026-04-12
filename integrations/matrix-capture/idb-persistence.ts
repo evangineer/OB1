@@ -10,6 +10,7 @@ import "fake-indexeddb/auto";
 
 import fs from "node:fs";
 import path from "node:path";
+import v8 from "node:v8";
 import { indexedDB as fakeIndexedDB } from "fake-indexeddb";
 
 type IdbStoreSnapshot = {
@@ -113,8 +114,8 @@ function isValidIdbDatabaseSnapshot(value: unknown): value is IdbDatabaseSnapsho
   );
 }
 
-function parseSnapshotPayload(data: string): IdbDatabaseSnapshot[] | null {
-  const parsed = JSON.parse(data) as unknown;
+function parseSnapshotPayload(data: Buffer): IdbDatabaseSnapshot[] | null {
+  const parsed = v8.deserialize(data) as unknown;
   if (!Array.isArray(parsed) || parsed.length === 0) {
     return null;
   }
@@ -247,7 +248,7 @@ export async function restoreIdbFromDisk(snapshotPath: string): Promise<boolean>
       if (!fs.existsSync(snapshotPath)) {
         return false;
       }
-      const data = fs.readFileSync(snapshotPath, "utf8");
+      const data = fs.readFileSync(snapshotPath);
       const snapshot = parseSnapshotPayload(data);
       if (!snapshot) {
         return false;
@@ -274,7 +275,7 @@ export async function persistIdbToDisk(params: {
       if (snapshot.length === 0) {
         return 0;
       }
-      fs.writeFileSync(snapshotPath, JSON.stringify(snapshot));
+      fs.writeFileSync(snapshotPath, v8.serialize(snapshot));
       fs.chmodSync(snapshotPath, 0o600);
       return snapshot.length;
     });
