@@ -519,6 +519,9 @@ async function main(): Promise<void> {
   requireEnv("MATRIX_ACCESS_TOKEN", MATRIX_ACCESS_TOKEN);
   requireEnv("MATRIX_USER_ID", MATRIX_USER_ID);
   const deviceId = await resolveDeviceId();
+  console.log(
+    `Matrix capture startup: userId=${MATRIX_USER_ID} deviceId=${deviceId} indexeddb=${MATRIX_USE_INDEXEDDB} snapshotPath=${MATRIX_INDEXEDDB_SNAPSHOT_PATH}`
+  );
 
   const client = sdk.createClient({
     baseUrl: MATRIX_HOMESERVER_URL,
@@ -546,6 +549,7 @@ async function main(): Promise<void> {
   if (!crypto) {
     throw new Error("Matrix crypto failed to initialize");
   }
+  console.log("Matrix crypto initialized");
 
   const decryptBridge = new MatrixDecryptBridge({
     client,
@@ -653,10 +657,31 @@ async function main(): Promise<void> {
     void handleVerificationRequest(request);
   });
 
+  (
+    crypto as unknown as {
+      on: (event: string, listener: (...args: unknown[]) => void) => void;
+    }
+  ).on("UserTrustStatusChanged", (...args: unknown[]) => {
+    console.log("Matrix crypto event: UserTrustStatusChanged", args.length);
+  });
+
   client.once(sdk.ClientEvent.Sync, (state) => {
     if (state === "PREPARED") {
       console.log("Matrix client prepared");
     }
+  });
+
+  client.on(sdk.ClientEvent.Sync, (state, prevState, data) => {
+    if (state === "ERROR") {
+      console.warn("Matrix sync entered ERROR state", {
+        data,
+        prevState,
+      });
+    }
+  });
+
+  client.on(sdk.HttpApiEvent.SessionLoggedOut, (error) => {
+    console.warn("Matrix session logged out", error);
   });
 
   await client.startClient({
