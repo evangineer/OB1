@@ -13,9 +13,8 @@ const MCP_ACCESS_KEY = Deno.env.get("MCP_ACCESS_KEY")!;
 const SUPABASE_SCHEMA = Deno.env.get("SUPABASE_SCHEMA") || "public";
 
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY, {
-  db: { schema: SUPABASE_SCHEMA },
-});
+const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+const tenantDb = supabase.schema(SUPABASE_SCHEMA);
 
 async function getEmbedding(text: string): Promise<number[]> {
   const r = await fetch(`${OPENROUTER_BASE}/embeddings`, {
@@ -93,7 +92,7 @@ server.registerTool(
   async ({ query, limit, threshold }) => {
     try {
       const qEmb = await getEmbedding(query);
-      const { data, error } = await supabase.rpc("match_thoughts", {
+      const { data, error } = await tenantDb.rpc("match_thoughts", {
         query_embedding: qEmb,
         match_threshold: threshold,
         match_count: limit,
@@ -174,7 +173,7 @@ server.registerTool(
   },
   async ({ limit, type, topic, person, days }) => {
     try {
-      let q = supabase
+      let q = tenantDb
         .from("thoughts")
         .select("content, metadata, created_at")
         .order("created_at", { ascending: false })
@@ -240,11 +239,11 @@ server.registerTool(
   },
   async () => {
     try {
-      const { count } = await supabase
+      const { count } = await tenantDb
         .from("thoughts")
         .select("*", { count: "exact", head: true });
 
-      const { data } = await supabase
+      const { data } = await tenantDb
         .from("thoughts")
         .select("metadata, created_at")
         .order("created_at", { ascending: false });
@@ -319,7 +318,7 @@ server.registerTool(
         extractMetadata(content),
       ]);
 
-      const { data: upsertResult, error: upsertError } = await supabase.rpc("upsert_thought", {
+      const { data: upsertResult, error: upsertError } = await tenantDb.rpc("upsert_thought", {
         p_content: content,
         p_payload: { metadata: { ...metadata, source: "mcp" } },
       });
@@ -332,7 +331,7 @@ server.registerTool(
       }
 
       const thoughtId = upsertResult?.id;
-      const { error: embError } = await supabase
+      const { error: embError } = await tenantDb
         .from("thoughts")
         .update({ embedding })
         .eq("id", thoughtId);
