@@ -405,4 +405,8 @@ app.all("*", async (c) => {
   return transport.handleRequest(c);
 });
 
-Deno.serve(app.fetch);
+export default app.fetch;
+
+if (import.meta.main) {
+  Deno.serve(app.fetch);
+}
