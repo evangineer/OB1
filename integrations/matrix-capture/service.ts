@@ -55,6 +55,7 @@ const MATRIX_SECRET_STORAGE_KEY = process.env.MATRIX_SECRET_STORAGE_KEY;
 const MATRIX_SECRET_STORAGE_KEY_BASE64 = process.env.MATRIX_SECRET_STORAGE_KEY_BASE64;
 const MATRIX_SECRET_STORAGE_PASSPHRASE = process.env.MATRIX_SECRET_STORAGE_PASSPHRASE;
 const SNAPSHOT_WRITE_INTERVAL_MS = 60_000;
+const MATRIX_CRYPTO_DEBUG = (process.env.MATRIX_CRYPTO_DEBUG || "false") === "true";
 
 const ALLOWED_MSG_TYPES = new Set(["m.text", "m.notice"]);
 const seenEventIds = new Set<string>();
@@ -64,6 +65,7 @@ const TIMELINE_DEBUG = (process.env.MATRIX_TIMELINE_DEBUG || "false") === "true"
 type RuntimeMatrixSdk = Pick<
   typeof MatrixSdk,
   | "ClientEvent"
+  | "HttpApiEvent"
   | "CryptoEvent"
   | "KnownMembership"
   | "MatrixEventEvent"
@@ -184,6 +186,87 @@ async function loadMatrixSdk(): Promise<RuntimeMatrixSdk> {
   }
 
   return matrixSdk;
+}
+
+async function installRustCryptoDiagnostics(): Promise<void> {
+  if (!MATRIX_CRYPTO_DEBUG) return;
+
+  const [{ OutgoingRequestProcessor }, { RustCrypto }] = await Promise.all([
+    import("matrix-js-sdk/lib/rust-crypto/OutgoingRequestProcessor.js"),
+    import("matrix-js-sdk/lib/rust-crypto/rust-crypto.js"),
+  ]);
+
+  const outgoingProto = OutgoingRequestProcessor.prototype as {
+    __ob1CryptoDebugPatched?: boolean;
+    makeOutgoingRequest: (msg: unknown, uiaCallback?: unknown) => Promise<void>;
+  };
+
+  if (!outgoingProto.__ob1CryptoDebugPatched) {
+    const originalMakeOutgoingRequest = outgoingProto.makeOutgoingRequest;
+    outgoingProto.makeOutgoingRequest = async function patchedMakeOutgoingRequest(
+      this: unknown,
+      msg: unknown,
+      uiaCallback?: unknown
+    ): Promise<void> {
+      const request = msg as {
+        body?: Record<string, unknown>;
+        constructor?: { name?: string };
+        id?: string;
+        type?: number | string;
+      };
+      const body = request.body;
+      const oneTimeKeys =
+        body && typeof body === "object" && "one_time_keys" in body
+          ? (body.one_time_keys as Record<string, unknown>)
+          : undefined;
+      const fallbackKeys =
+        body && typeof body === "object" && "fallback_keys" in body
+          ? (body.fallback_keys as Record<string, unknown>)
+          : undefined;
+
+      if (request.constructor?.name === "KeysUploadRequest" || request.type === 0 || oneTimeKeys) {
+        console.log(
+          `Matrix crypto debug: outgoing keys/upload request=${JSON.stringify({
+            fallbackKeyCount: fallbackKeys ? Object.keys(fallbackKeys).length : 0,
+            fallbackKeys: fallbackKeys ? Object.keys(fallbackKeys) : [],
+            id: request.id,
+            oneTimeKeyCount: oneTimeKeys ? Object.keys(oneTimeKeys).length : 0,
+            oneTimeKeys: oneTimeKeys ? Object.keys(oneTimeKeys) : [],
+            type: request.type,
+          })}`
+        );
+      }
+
+      return await originalMakeOutgoingRequest.call(this, msg, uiaCallback);
+    };
+    outgoingProto.__ob1CryptoDebugPatched = true;
+  }
+
+  const rustProto = RustCrypto.prototype as {
+    __ob1CryptoDebugPatched?: boolean;
+    processKeyCounts: (
+      oneTimeKeysCounts?: Record<string, number>,
+      unusedFallbackKeys?: string[],
+    ) => Promise<void>;
+  };
+
+  if (!rustProto.__ob1CryptoDebugPatched) {
+    const originalProcessKeyCounts = rustProto.processKeyCounts;
+    rustProto.processKeyCounts = async function patchedProcessKeyCounts(
+      this: unknown,
+      oneTimeKeysCounts?: Record<string, number>,
+      unusedFallbackKeys?: string[],
+    ): Promise<void> {
+      console.log(
+        `Matrix crypto debug: sync key counts=${JSON.stringify({
+          oneTimeKeysCounts: oneTimeKeysCounts || {},
+          unusedFallbackKeys: unusedFallbackKeys || [],
+        })}`
+      );
+      return await originalProcessKeyCounts.call(this, oneTimeKeysCounts, unusedFallbackKeys);
+    };
+    rustProto.__ob1CryptoDebugPatched = true;
+  }
 }
 
 function parseBase64Key(base64Value: string): Uint8Array {
@@ -511,6 +594,7 @@ async function waitForVerifier(
 
 async function main(): Promise<void> {
   const sdk = await loadMatrixSdk();
+  await installRustCryptoDiagnostics();
 
   requireEnv("SUPABASE_URL", SUPABASE_URL);
   requireEnv("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_ROLE_KEY);
@@ -680,7 +764,7 @@ async function main(): Promise<void> {
     }
   });
 
-  client.on(sdk.HttpApiEvent.SessionLoggedOut, (error) => {
+  client.on(sdk.HttpApiEvent.SessionLoggedOut, (error: unknown) => {
     console.warn("Matrix session logged out", error);
   });
 
