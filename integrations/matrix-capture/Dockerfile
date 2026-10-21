@@ -4,27 +4,18 @@ FROM ${NODE_IMAGE}
 
 WORKDIR /app
 
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends \
-    g++ \
-    libcairo2-dev \
-    libgif-dev \
-    libjpeg-dev \
-    libpango1.0-dev \
-    librsvg2-dev \
-    make \
-    pkg-config \
-    python3 \
-  && rm -rf /var/lib/apt/lists/*
+# G4: entrypoint.sh takes the writer lock with flock (util-linux); fail the build if it is missing.
+RUN command -v flock
 
-COPY package.json ./
-RUN npm install
+# Same dependency set as CI: the lockfile, installed with npm ci (tsx is a runtime dependency).
+COPY package.json package-lock.json ./
+RUN npm ci
 
-COPY service.ts ./
-COPY decrypt-bridge.ts ./
-COPY idb-persistence.ts ./
-COPY database.types.ts ./
+COPY *.ts entrypoint.sh ./
 
 RUN mkdir -p /data/indexeddb
 
-CMD ["npm", "run", "start"]
+# G7: node is started directly (not through npm or the tsx CLI, which fork) so SIGTERM reaches it;
+# the entrypoint takes the lock on fd 9 and execs this command.
+ENTRYPOINT ["/app/entrypoint.sh"]
+CMD ["node", "--import", "tsx", "service.ts"]

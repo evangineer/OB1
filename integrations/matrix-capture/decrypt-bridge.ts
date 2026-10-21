@@ -86,12 +86,17 @@ export class MatrixDecryptBridge {
     }
     this.trackedEncryptedEvents.add(event);
     event.on(MatrixEventEvent.Decrypted, (decryptedEvent: MatrixEvent, err?: Error) => {
-      this.handleEncryptedEventDecrypted({
-        roomId,
-        encryptedEvent: event,
-        decryptedEvent,
-        err,
-      });
+      // Never throw into the SDK's emit: during sync processing that would stop the bot.
+      try {
+        this.handleEncryptedEventDecrypted({
+          roomId,
+          encryptedEvent: event,
+          decryptedEvent,
+          err,
+        });
+      } catch (error) {
+        console.error("Matrix decrypted-event handler failed:", error);
+      }
     });
   }
 
@@ -109,7 +114,9 @@ export class MatrixDecryptBridge {
       if (state.inFlight) {
         continue;
       }
-      void this.runDecryptRetry(retryKey);
+      this.runDecryptRetry(retryKey).catch((error: unknown) => {
+        console.error("Matrix decryption retry failed:", error);
+      });
     }
   }
 
@@ -120,7 +127,11 @@ export class MatrixDecryptBridge {
     this.cryptoRetrySignalsBound = true;
 
     const trigger = (reason: string): void => {
-      this.retryPendingNow(reason);
+      try {
+        this.retryPendingNow(reason);
+      } catch (error) {
+        console.error(`Matrix decryption retry trigger (${reason}) failed:`, error);
+      }
     };
 
     crypto.on(CryptoEvent.KeyBackupDecryptionKeyCached, () => {
@@ -233,7 +244,7 @@ export class MatrixDecryptBridge {
     const attempts = (existing?.attempts ?? 0) + 1;
     if (attempts > MATRIX_DECRYPT_RETRY_MAX_ATTEMPTS) {
       this.clearDecryptRetry(retryKey);
-      console.log(
+      console.warn(
         `Giving up decryption retry for ${params.eventId} in ${params.roomId} after ${attempts - 1} attempts`,
       );
       return;
@@ -251,7 +262,9 @@ export class MatrixDecryptBridge {
       timer: null,
     };
     next.timer = setTimeout(() => {
-      void this.runDecryptRetry(retryKey);
+      this.runDecryptRetry(retryKey).catch((error: unknown) => {
+        console.error("Matrix decryption retry failed:", error);
+      });
     }, delayMs);
     this.decryptRetries.set(retryKey, next);
   }

@@ -1,0 +1,3 @@
+*.test.ts
+test-fixtures/
+node_modules

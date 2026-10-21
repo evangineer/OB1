@@ -19,7 +19,7 @@ For Node/container deployments, this service now provides its own persistent Ind
 - Working Open Brain setup ([guide](../../docs/01-getting-started.md))
 - A Matrix homeserver you control or can administer
 - A Matrix bot user with access to the rooms you want to capture
-- Node.js 20+ or another runtime compatible with this service wrapper
+- Node.js 20 (the reference runtime, `node:20-bookworm-slim`; newer releases fail the tests, see [Tests](#tests))
 - OpenRouter API key for embeddings and metadata extraction
 - If you want to unlock encrypted history and backups on first startup, your Matrix secret storage recovery material
 
@@ -75,13 +75,15 @@ Install the service from this folder in the repo where you manage deployments.
 
 **1. Install dependencies:**
 ```bash
-npm install
+npm ci
 ```
 
 **2. Start the service:**
 ```bash
-npm run start
+sh entrypoint.sh node --import tsx service.ts
 ```
+
+With `MATRIX_USE_INDEXEDDB=true` the service must run under [`entrypoint.sh`](./entrypoint.sh): it takes the writer lock on `<MATRIX_INDEXEDDB_PATH>/.writer.lock` and then `exec`s node, and node refuses to start without that lock (see [Failure Modes](#failure-modes)). `npm run start` (plain `tsx service.ts`) only works with `MATRIX_USE_INDEXEDDB=false`.
 
 The main runtime file is [`service.ts`](./service.ts). The older [`index.ts`](./index.ts) remains as a stateless polling example for unencrypted rooms, but it is not the E2EE path.
 
@@ -95,7 +97,11 @@ If Docker Compose is your standard target, this folder now includes:
 - [`docker-compose.yml`](./docker-compose.yml)
 - [`env.matrix-capture.example`](./env.matrix-capture.example)
 
-The Dockerfile now defaults to a Debian-based Node image. The container mounts `/data` as a named volume, and the recommended default is `MATRIX_USE_INDEXEDDB=true` so the service can persist a fake IndexedDB snapshot for Matrix Rust crypto under that volume.
+The Dockerfile uses `node:20-bookworm-slim`, installs dependencies with `npm ci` from `package-lock.json`, and runs `entrypoint.sh` as the `ENTRYPOINT` with `node --import tsx service.ts` as the command, so node (not npm) receives SIGTERM. The container mounts `/data` as a named volume, and the recommended default is `MATRIX_USE_INDEXEDDB=true` so the service can persist a fake IndexedDB snapshot for Matrix Rust crypto under that volume.
+
+- The writer lock uses `flock`, which is only reliable on a **local** volume. Do not put `/data` on NFS or another network filesystem.
+- Run exactly one container per volume. A second one refuses with the G4 message and exits 75.
+- Shutdown is bounded at 20 s. Give the container a longer stop window (`stop_grace_period: 30s`) so Docker does not SIGKILL it mid-save.
 
 **1. Copy the example env file:**
 ```bash
@@ -126,7 +132,7 @@ Use this checklist before calling the deployment good:
 - Service logs do not show Rust crypto initialization failures
 - If `MATRIX_USE_INDEXEDDB=true`, the container can write to both `MATRIX_INDEXEDDB_PATH` and `MATRIX_INDEXEDDB_SNAPSHOT_PATH`
 - restarting the container preserves Matrix device crypto state and does not force one-time-key re-registration for the same device
-- If `MATRIX_USE_INDEXEDDB=false`, restarts rely on Matrix secret storage / key backup rather than local IndexedDB continuity
+- If `MATRIX_USE_INDEXEDDB=false`, crypto state is in memory only: each start creates a new device account, so a restart on a device the homeserver already knows refuses with the G1 mismatch. Use it only for throwaway devices.
 - A newly sent message in a monitored encrypted room is decrypted and logged as `Captured <event_id>`
 - The corresponding row appears in `thoughts` with `metadata.matrix_event_id`
 - Re-sending the same event through restart/re-sync does not produce a duplicate row
@@ -194,7 +200,8 @@ Set the environment variables your service needs:
 - `MATRIX_USER_ID`
 - `MATRIX_ROOM_IDS` as a comma-separated allowlist
 - `MATRIX_USE_INDEXEDDB` to enable the snapshot-backed IndexedDB Rust crypto path
-- `MATRIX_CRYPTO_DB_PREFIX`, `MATRIX_CRYPTO_STORE_PASSWORD`, `MATRIX_INDEXEDDB_PATH`, and optionally `MATRIX_INDEXEDDB_SNAPSHOT_PATH` if `MATRIX_USE_INDEXEDDB=true`
+- `MATRIX_CRYPTO_STORE_PASSWORD`, `MATRIX_INDEXEDDB_PATH`, and optionally `MATRIX_INDEXEDDB_SNAPSHOT_PATH` (default `<MATRIX_INDEXEDDB_PATH>/crypto-idb-snapshot.json`) if `MATRIX_USE_INDEXEDDB=true`
+- `MATRIX_CRYPTO_DB_PREFIX` is **inert**: it is read but not used. Wiring it in would rename the IndexedDB databases and orphan existing stores, so it stays unused.
 - One of:
   `MATRIX_SECRET_STORAGE_KEY_BASE64`, `MATRIX_SECRET_STORAGE_KEY`, or `MATRIX_SECRET_STORAGE_PASSPHRASE`
 - Optional:
@@ -215,7 +222,7 @@ export MATRIX_USE_INDEXEDDB=true
 export MATRIX_CRYPTO_DB_PREFIX=ob1-matrix-capture
 export MATRIX_CRYPTO_STORE_PASSWORD=choose-a-local-store-password
 export MATRIX_INDEXEDDB_PATH=/data/indexeddb
-export MATRIX_INDEXEDDB_SNAPSHOT_PATH=/data/indexeddb/crypto-idb-snapshot.bin
+export MATRIX_INDEXEDDB_SNAPSHOT_PATH=/data/indexeddb/crypto-idb-snapshot.json
 export MATRIX_SECRET_STORAGE_PASSPHRASE='your secret storage passphrase'
 ```
 
@@ -254,10 +261,10 @@ Duplicate inserts are avoided because deduplication happens on `metadata.matrix_
 ## Troubleshooting
 
 **Issue: Snapshot-backed IndexedDB startup fails in Node**
-Solution: Inspect the startup logs for snapshot restore errors. As an emergency fallback you can set `MATRIX_USE_INDEXEDDB=false` and restart the service, but that reverts the device to ephemeral in-memory crypto state.
+Solution: Find the first `refusing to start:` line in the logs; it names the failed check (see [Failure Modes](#failure-modes)). Do not fall back to `MATRIX_USE_INDEXEDDB=false` on an existing device: a fresh in-memory store does not match the device keys the homeserver holds, so G1 refuses it too. Recover by restoring the snapshot or rotating to a new device.
 
 **Issue: Snapshot file permissions or writes fail**
-Solution: Confirm the container can write to `MATRIX_INDEXEDDB_PATH` and `MATRIX_INDEXEDDB_SNAPSHOT_PATH` on the mounted `/data` volume. The service writes the snapshot atomically and expects restrictive file permissions.
+Solution: Confirm the container can write to `MATRIX_INDEXEDDB_PATH` and `MATRIX_INDEXEDDB_SNAPSHOT_PATH` on the mounted `/data` volume. Each save writes a new `<snapshot>.tmp` exclusively with mode 0600, fsyncs it, renames it over the snapshot and fsyncs the directory, so a crash leaves either the old snapshot or the new one. A failed save is logged as `Matrix IndexedDB snapshot save failed (...)`; "Persisted Matrix IndexedDB snapshot" is logged only on success.
 
 **Issue: The service sees encrypted events but never captures them**
 Solution: Verify the bot device from a trusted Matrix client and confirm it has actually received the Megolm session keys for that room. Without device trust and room keys, the SDK cannot decrypt the message payload.
@@ -279,8 +286,11 @@ Solution: Check `SUPABASE_SERVICE_ROLE_KEY`, `OPENROUTER_API_KEY`, and your `tho
 The current implementation follows the OpenClaw-style Node persistence model that replaced the earlier `indexeddbshim` experiment.
 
 - `service.ts` now provides IndexedDB in Node via `fake-indexeddb`
-- on startup it restores a persisted snapshot before `initRustCrypto(...)`
-- during runtime and shutdown it writes the updated snapshot back to disk atomically
+- the snapshot is a v8-serialised dump of every IndexedDB database (each dumped in one read-only transaction), stored at `crypto-idb-snapshot.json` despite the `.json` name
+- on startup it restores the snapshot before `initRustCrypto(...)`; a snapshot that exists but cannot be restored stops the service (G2), and no snapshot is written before a successful restore or a confirmed fresh start
+- after crypto init, the local device keys are compared with a raw `POST /keys/query`; until that check passes, every outgoing crypto request and every save waits at a startup gate (G1)
+- the snapshot is saved before any request that publishes crypto state (`/keys/upload`, signature and signing-key uploads, `sendToDevice`, key-backup uploads) and, after a sync that delivered to-device events, before the next `/sync`; a 60 s interval save and a final save at shutdown back this up (G5)
+- each save is atomic: exclusive 0600 temp file, fsync, rename, directory fsync (G3)
 - Matrix secret storage and key backup are still used for bootstrap and historical recovery; the snapshot is only for device continuity
 
 Reference material:
@@ -295,6 +305,39 @@ Reference material:
 - a dedicated capture device can complete self-verification successfully
 - encrypted room traffic remains decryptable after restart without re-issuing a new device token
 - the snapshot file is stored only on the persistent volume and is treated as sensitive local state
+
+## Failure Modes
+
+The service stops rather than run on crypto state it cannot trust. The first error line names the check. Restarts on failure repeat the same line until the cause is fixed.
+
+| Line | Exit | Meaning and fix |
+| --- | --- | --- |
+| `refusing to start: G4 another writer holds <MATRIX_INDEXEDDB_PATH>/.writer.lock` | 75 | Printed by `entrypoint.sh`. Another process holds the store's writer lock. Stop the other container; never run two writers on one volume. |
+| `refusing to start: G4 not running under the writer lock` | 1 | Node was started without `entrypoint.sh` (or with a different lock), so it does not hold the lock itself. Start through the entrypoint. |
+| `refusing to start: G4 cannot check writer lock: <detail>` | 1 | The lock check itself failed, e.g. `flock` is missing. |
+| `refusing to start: G2 restore failed: <error>` | 1 | A snapshot exists but could not be restored. The snapshot is left untouched; restore it from backup or rotate the device. |
+| `refusing to start: G1 device-key mismatch for <user>/<device>; local crypto store does not match the homeserver; see RUNBOOK "Matrix device reauth"` | 1 | The local store's device keys differ from what the homeserver holds. Nothing has been published or saved. Rotate to a new device (RUNBOOK "Matrix device reauth"). |
+| `refusing to start: G1 could not verify device keys: <status or error>` | 1 | `/keys/query` failed, so the check could not run. Fix homeserver reachability; nothing has been published or saved. |
+| `Matrix capture stopping: incoming crypto processing failed` | 1 | Processing a sync's crypto data failed. Saves are disabled (`snapshot saves disabled: incoming crypto processing failed`), no further `/sync` is sent, and the service exits without a final save. The unacknowledged to-device messages are redelivered after the restart. |
+| `Matrix sync held: snapshot save failed: <error>` then `Matrix capture stopping: snapshot save failed: <error>` | 1 | The save after a to-device sync failed for good; the next `/sync` is never sent. |
+| `Matrix IndexedDB snapshot save failed (<reason>; <n> consecutive): <error>` | — | A save failed. Logged at `warn`, and at `error` from the 3rd consecutive failure. A publish waiting on that save stays unsent and the SDK retries it. |
+| `Matrix capture stopping: snapshot saves failing for <seconds>s` | 1 | Saves have failed continuously for 10 minutes. Restarting from the last durable snapshot is safe. |
+| `Matrix capture shutdown timeout; exiting 1` / `Matrix capture shutdown save-failed; exiting 1` | 1 | Shutdown did not finish within 20 s, or its final save failed. |
+| `Matrix capture stopping: event loop drained before shutdown (a startup step never completed)` | 1 | A startup step waited on something that can never arrive (for example a crypto request held at the startup gate), so nothing was left to run. Without this line node would exit 0 and not be restarted. |
+
+Startup also logs `no snapshot; starting with an empty crypto store` (warn) when there is no snapshot file, and `device not known to homeserver; new device` when the homeserver has no keys for the device yet; neither is an error.
+
+Decryption problems are always logged, independent of `MATRIX_TIMELINE_DEBUG`: `Matrix decryption failed { eventId, roomId, sender }` (warn, once per event) and `Giving up decryption retry for <event> in <room> after <n> attempts` (warn).
+
+## Tests
+
+Node 20 is required for the tests (the reference runtime is `node:20-bookworm-slim`). matrix-js-sdk and its WASM crypto are imported as ESM, and those imports fail under tsx on newer Node releases. Run the suite in a Node 20 container from this folder after `npm ci`:
+
+```bash
+docker run --rm -v "$PWD":/app:ro -w /app -e HOME=/tmp node:20-bookworm-slim node --import tsx --test *.test.ts
+```
+
+`npm run typecheck` runs locally on any Node version.
 
 ## Multi-User Note
 

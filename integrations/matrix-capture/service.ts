@@ -9,6 +9,7 @@
 import { join } from "node:path";
 import type * as MatrixSdk from "matrix-js-sdk";
 import { VerificationMethod } from "matrix-js-sdk/lib/types.js";
+import { MemoryCryptoStore } from "matrix-js-sdk/lib/crypto/store/memory-crypto-store.js";
 import { decodeRecoveryKey } from "matrix-js-sdk/lib/crypto-api/recovery-key.js";
 import { deriveRecoveryKeyFromPassphrase } from "matrix-js-sdk/lib/crypto-api/key-passphrase.js";
 import {
@@ -20,7 +21,18 @@ import {
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { Database } from "./database.types.js";
 import { MatrixDecryptBridge } from "./decrypt-bridge.js";
+import { fetchServerDeviceKeys, type StartupGate } from "./crypto-guard.js";
 import { persistIdbToDisk, restoreIdbFromDisk } from "./idb-persistence.js";
+import { runShutdown } from "./shutdown.js";
+import {
+  installPublishDurability,
+  installSyncDurability,
+  isPublishingRequest,
+  latchIncomingFailure,
+  SnapshotScheduler,
+} from "./snapshot-scheduler.js";
+import { runStartup } from "./startup.js";
+import { assertRunningUnderWriterLock, removeLegacyLockDirs } from "./writer-lock.js";
 
 const SUPABASE_URL = process.env.SUPABASE_URL!;
 const SUPABASE_SERVICE_ROLE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
@@ -54,7 +66,9 @@ const MATRIX_USE_INDEXEDDB = (process.env.MATRIX_USE_INDEXEDDB || "false") === "
 const MATRIX_SECRET_STORAGE_KEY = process.env.MATRIX_SECRET_STORAGE_KEY;
 const MATRIX_SECRET_STORAGE_KEY_BASE64 = process.env.MATRIX_SECRET_STORAGE_KEY_BASE64;
 const MATRIX_SECRET_STORAGE_PASSPHRASE = process.env.MATRIX_SECRET_STORAGE_PASSPHRASE;
+const MATRIX_WRITER_LOCK_PATH = join(MATRIX_INDEXEDDB_PATH, ".writer.lock");
 const SNAPSHOT_WRITE_INTERVAL_MS = 60_000;
+const SHUTDOWN_TIMEOUT_MS = 20_000;
 const MATRIX_CRYPTO_DEBUG = (process.env.MATRIX_CRYPTO_DEBUG || "false") === "true";
 
 const ALLOWED_MSG_TYPES = new Set(["m.text", "m.notice"]);
@@ -77,8 +91,6 @@ let supabase: SupabaseClient<Database> | undefined;
 
 type MatrixEvent = MatrixSdk.MatrixEvent;
 type MatrixRoom = MatrixSdk.Room;
-let snapshotPersistTimer: NodeJS.Timeout | undefined;
-let snapshotPersistInFlight = false;
 
 function requireEnv(name: string, value: string | undefined): void {
   if (!value) throw new Error(`Missing required environment variable: ${name}`);
@@ -106,6 +118,36 @@ function debugTimeline(message: string, details: Record<string, unknown>): void 
   console.log(`[timeline] ${message} ${JSON.stringify(details)}`);
 }
 
+function logListenerError(name: string, error: unknown): void {
+  try {
+    console.error(`Matrix listener ${name} failed:`, error);
+  } catch {
+    // Logging must never turn into a throw inside an SDK emit.
+  }
+}
+
+/**
+ * Wraps an SDK event listener so it can never throw into the emitter. A synchronous throw from a
+ * listener during sync processing becomes SyncUnexpectedError, which latches incoming failure (G5)
+ * and stops the bot. A returned promise gets a rejection handler for the same reason.
+ */
+function guarded<A extends unknown[]>(name: string, fn: (...args: A) => unknown): (...args: A) => void {
+  return (...args: A) => {
+    try {
+      const result = fn(...args);
+      if (result && typeof (result as Promise<unknown>).then === "function") {
+        (result as Promise<unknown>).then(undefined, (error: unknown) => logListenerError(name, error));
+      }
+    } catch (error) {
+      logListenerError(name, error);
+    }
+  };
+}
+
+function runCapture(event: MatrixEvent, room: MatrixRoom): void {
+  captureMessage(event, room).catch((error: unknown) => logListenerError("captureMessage", error));
+}
+
 async function resolveDeviceId(): Promise<string> {
   if (MATRIX_DEVICE_ID) return MATRIX_DEVICE_ID;
 
@@ -130,56 +172,11 @@ async function resolveDeviceId(): Promise<string> {
   return body.device_id;
 }
 
-async function persistIndexedDbSnapshot(reason: string): Promise<void> {
-  if (!MATRIX_USE_INDEXEDDB || snapshotPersistInFlight) return;
-  snapshotPersistInFlight = true;
-
-  try {
-    await persistIdbToDisk({
-      snapshotPath: MATRIX_INDEXEDDB_SNAPSHOT_PATH,
-    });
-    console.log(`Persisted Matrix IndexedDB snapshot (${reason})`);
-  } finally {
-    snapshotPersistInFlight = false;
-  }
-}
-
-function scheduleSnapshotPersistence(): void {
-  if (!MATRIX_USE_INDEXEDDB || snapshotPersistTimer) return;
-
-  snapshotPersistTimer = setInterval(() => {
-    void persistIndexedDbSnapshot("interval").catch((error) => {
-      console.error("Failed to persist Matrix IndexedDB snapshot:", error);
-    });
-  }, SNAPSHOT_WRITE_INTERVAL_MS);
-  snapshotPersistTimer.unref();
-}
-
-function stopSnapshotPersistence(): void {
-  if (!snapshotPersistTimer) return;
-  clearInterval(snapshotPersistTimer);
-  snapshotPersistTimer = undefined;
-}
-
-async function preparePersistentIndexedDb(): Promise<void> {
-  await restoreIdbFromDisk(MATRIX_INDEXEDDB_SNAPSHOT_PATH);
-}
-
-async function persistSnapshotOnShutdown(): Promise<void> {
-  stopSnapshotPersistence();
-
-  try {
-    await persistIndexedDbSnapshot("shutdown");
-  } catch (error) {
-    console.error("Failed to persist Matrix IndexedDB snapshot during shutdown:", error);
-  }
-}
-
 async function loadMatrixSdk(): Promise<RuntimeMatrixSdk> {
   if (matrixSdk) return matrixSdk;
 
+  // The snapshot is restored later, inside runStartup (G2), before initRustCrypto.
   if (MATRIX_USE_INDEXEDDB) {
-    await preparePersistentIndexedDb();
     matrixSdk = (await import("matrix-js-sdk/lib/browser-index.js")) as RuntimeMatrixSdk;
   } else {
     matrixSdk = (await import("matrix-js-sdk")) as RuntimeMatrixSdk;
@@ -537,7 +534,7 @@ function queueCapture(event: MatrixEvent, room: MatrixRoom, toStartOfTimeline?: 
       eventId: event.getId(),
       roomId: room.roomId,
     });
-    void captureMessage(event, room);
+    runCapture(event, room);
     return;
   }
 
@@ -576,18 +573,18 @@ async function handleVerificationRequest(
 
     const verifier = await waitForVerifier(requestId, request);
 
-    verifier.on(VerifierEvent.ShowSas, (callbacks: ShowSasCallbacks) => {
+    verifier.on(VerifierEvent.ShowSas, guarded("Verifier.showSas", (callbacks: ShowSasCallbacks) => {
       console.log(
         `Auto-confirming SAS for request ${requestId}: ${formatSas(callbacks.sas)}`
       );
       void callbacks.confirm().catch((error: unknown) => {
         console.error(`Failed to confirm SAS for request ${requestId}:`, error);
       });
-    });
+    }));
 
-    verifier.on(VerifierEvent.Cancel, (error: Error | MatrixEvent) => {
+    verifier.on(VerifierEvent.Cancel, guarded("Verifier.cancel", (error: Error | MatrixEvent) => {
       console.warn(`Verification ${requestId} was cancelled:`, error);
-    });
+    }));
 
     await verifier.verify();
     console.log(`Verification ${requestId} completed`);
@@ -620,9 +617,23 @@ async function waitForVerifier(
   throw new Error(`Timed out waiting for verifier on request ${requestId}`);
 }
 
+let shuttingDown = false;
+
+// A startup step that waits forever on a held request leaves nothing scheduled; node would then
+// exit 0 silently and an on-failure restart policy would not restart it. Make that loud instead.
+process.on("beforeExit", () => {
+  if (shuttingDown) return;
+  console.error("Matrix capture stopping: event loop drained before shutdown (a startup step never completed)");
+  process.exit(1);
+});
+
 async function main(): Promise<void> {
   const sdk = await loadMatrixSdk();
   await installRustCryptoDiagnostics();
+  const [{ OutgoingRequestProcessor }, { RustCrypto }] = await Promise.all([
+    import("matrix-js-sdk/lib/rust-crypto/OutgoingRequestProcessor.js"),
+    import("matrix-js-sdk/lib/rust-crypto/rust-crypto.js"),
+  ]);
 
   requireEnv("SUPABASE_URL", SUPABASE_URL);
   requireEnv("SUPABASE_SERVICE_ROLE_KEY", SUPABASE_SERVICE_ROLE_KEY);
@@ -635,6 +646,8 @@ async function main(): Promise<void> {
     `Matrix capture startup: userId=${MATRIX_USER_ID} deviceId=${deviceId} indexeddb=${MATRIX_USE_INDEXEDDB} snapshotPath=${MATRIX_INDEXEDDB_SNAPSHOT_PATH}`
   );
 
+  // Ruling R2: createClient sends no crypto requests, so the client exists before the gated
+  // startup and installHooks can latch incoming failures on it.
   const client = sdk.createClient({
     baseUrl: MATRIX_HOMESERVER_URL,
     accessToken: MATRIX_ACCESS_TOKEN,
@@ -642,19 +655,103 @@ async function main(): Promise<void> {
     deviceId,
     timelineSupport: true,
     useAuthorizationHeader: true,
+    // No legacy (libolm) crypto store: this service has only ever used Rust crypto. browser-index
+    // would otherwise supply an IndexedDB legacy store, which the snapshot then carries; on restart
+    // its mere existence makes initRustCrypto await an own-keys query that the closed startup gate
+    // holds, so startup would deadlock. An empty memory store never triggers that migration path.
+    cryptoStore: new MemoryCryptoStore(),
     cryptoCallbacks: {
       getSecretStorageKey: async (opts) => getSecretStorageKey(opts.keys),
     },
   });
 
-  await client.initRustCrypto({
-    useIndexedDB: MATRIX_USE_INDEXEDDB,
-    storagePassword: MATRIX_USE_INDEXEDDB ? MATRIX_CRYPTO_STORE_PASSWORD : undefined,
+  // Only the IndexedDB mode has a store to save; the gate applies either way.
+  let scheduler: SnapshotScheduler | undefined;
+  // Set synchronously by the failure latch; after it no save (and so no publish) may run.
+  let savesDisabled = false;
+
+  const installHooks = (gate: StartupGate): void => {
+    if (MATRIX_USE_INDEXEDDB) {
+      scheduler = new SnapshotScheduler({
+        persist: () => persistIdbToDisk({ snapshotPath: MATRIX_INDEXEDDB_SNAPSHOT_PATH }),
+        gate,
+        onFatal: (reason) => {
+          console.error(`Matrix capture stopping: ${reason}`);
+          process.exit(1);
+        },
+      });
+    }
+    const saver = scheduler;
+    installPublishDurability(OutgoingRequestProcessor.prototype, {
+      gate,
+      isPublishing: isPublishingRequest,
+      beforePublish: async () => {
+        if (!saver) return;
+        const result = await saver.save("before publish");
+        if (!result.ok) throw result.error ?? new Error("snapshot save failed");
+      },
+    });
+    installSyncDurability(RustCrypto.prototype, {
+      save: () => (saver ? saver.saveUntilOk("after to-device sync") : Promise.resolve()),
+      onIncomingFailure: (reason) => {
+        // No final save: the store holds state from a sync whose processing failed.
+        try {
+          console.error(`Matrix capture stopping: ${reason}`);
+        } finally {
+          process.exit(1);
+        }
+      },
+      onLatched: (reason) => {
+        savesDisabled = true;
+        saver?.poison(reason);
+      },
+    });
+    latchIncomingFailure(client, RustCrypto.prototype);
+  };
+
+  await runStartup({
+    assertWriterLock: () => {
+      if (MATRIX_USE_INDEXEDDB) assertRunningUnderWriterLock(MATRIX_WRITER_LOCK_PATH);
+    },
+    removeLegacyLocks: () => {
+      if (MATRIX_USE_INDEXEDDB) removeLegacyLockDirs(MATRIX_INDEXEDDB_SNAPSHOT_PATH, console);
+    },
+    restore: () =>
+      MATRIX_USE_INDEXEDDB
+        ? restoreIdbFromDisk(MATRIX_INDEXEDDB_SNAPSHOT_PATH)
+        : Promise.resolve({ status: "absent" as const }),
+    installHooks,
+    initCrypto: () =>
+      client.initRustCrypto({
+        useIndexedDB: MATRIX_USE_INDEXEDDB,
+        storagePassword: MATRIX_USE_INDEXEDDB ? MATRIX_CRYPTO_STORE_PASSWORD : undefined,
+      }),
+    ownDeviceKeys: async () => {
+      const crypto = client.getCrypto();
+      if (!crypto) throw new Error("Matrix crypto failed to initialize");
+      return await crypto.getOwnDeviceKeys();
+    },
+    serverDeviceKeys: () =>
+      fetchServerDeviceKeys({
+        homeserverUrl: MATRIX_HOMESERVER_URL,
+        accessToken: MATRIX_ACCESS_TOKEN,
+        userId: MATRIX_USER_ID,
+        deviceId,
+      }),
+    ids: { userId: MATRIX_USER_ID, deviceId },
+    log: console,
   });
 
-  if (MATRIX_USE_INDEXEDDB) {
-    await persistIndexedDbSnapshot("post-init");
-    scheduleSnapshotPersistence();
+  let snapshotTimer: NodeJS.Timeout | undefined;
+  if (scheduler) {
+    const saver = scheduler;
+    await saver.save("post-init");
+    snapshotTimer = setInterval(() => {
+      saver.save("interval").catch((error: unknown) => {
+        console.error("Matrix IndexedDB snapshot interval save failed:", error);
+      });
+    }, SNAPSHOT_WRITE_INTERVAL_MS);
+    snapshotTimer.unref();
   }
 
   const crypto = client.getCrypto();
@@ -665,15 +762,15 @@ async function main(): Promise<void> {
 
   const decryptBridge = new MatrixDecryptBridge({
     client,
-    emitDecryptedEvent: (roomId, event) => {
+    emitDecryptedEvent: guarded("decryptBridge.decrypted", (roomId: string, event: MatrixEvent) => {
       debugTimeline("queueCapture.decrypted", {
         decryptionFailure: event.isDecryptionFailure(),
         eventId: event.getId(),
         eventType: event.getType(),
         roomId,
       });
-    },
-    emitMessage: (roomId, event) => {
+    }),
+    emitMessage: guarded("decryptBridge.message", (roomId: string, event: MatrixEvent) => {
       const room = client.getRoom(roomId);
       if (!room) {
         debugTimeline("captureMessage.skip.missing_room", {
@@ -686,19 +783,46 @@ async function main(): Promise<void> {
         eventId: event.getId(),
         roomId,
       });
-      void captureMessage(event, room);
-    },
-    emitFailedDecryption: (roomId, event, error) => {
+      runCapture(event, room);
+    }),
+    emitFailedDecryption: guarded("decryptBridge.failedDecryption", (roomId: string, event: MatrixEvent, error: Error) => {
+      console.warn("Matrix decryption failed", { eventId: event.getId(), roomId, sender: event.getSender() });
       debugTimeline("queueCapture.retry.failed_decryption", {
         error: String(error),
         eventId: event.getId(),
         roomId,
       });
-    },
+    }),
   });
   decryptBridge.bindCryptoRetrySignals(
     crypto as unknown as { on: (eventName: string, listener: (...args: unknown[]) => void) => void },
   );
+
+  // G7: bounded shutdown; exits non-zero on timeout or a failed final save. Runs once.
+  shuttingDown = false;
+  const shutdown = (): void => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    console.log("Stopping Matrix capture service");
+    void runShutdown(async () => {
+      if (snapshotTimer) clearInterval(snapshotTimer);
+      client.stopClient();
+      decryptBridge.stop();
+      await decryptBridge.drainPendingDecryptions("matrix capture shutdown");
+      if (scheduler && !savesDisabled) return scheduler.save("shutdown");
+    }, SHUTDOWN_TIMEOUT_MS).then(
+      ({ outcome, exitCode }) => {
+        if (outcome !== "done") console.error(`Matrix capture shutdown ${outcome}; exiting ${exitCode}`);
+        process.exit(exitCode);
+      },
+      (error: unknown) => {
+        console.error("Matrix capture shutdown failed:", error);
+        process.exit(1);
+      },
+    );
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
 
   try {
     await crypto.bootstrapCrossSigning({});
@@ -727,7 +851,9 @@ async function main(): Promise<void> {
     console.warn("Key backup check failed:", error);
   }
 
-  client.on(sdk.RoomEvent.MyMembership, (room, membership) => {
+  // Every listener below is guarded: a synchronous throw during sync processing would latch
+  // incoming failure (G5) and stop the bot.
+  client.on(sdk.RoomEvent.MyMembership, guarded("Room.myMembership", (room: MatrixRoom, membership: string) => {
     if (!MATRIX_AUTOJOIN_INVITES) return;
     if (membership !== sdk.KnownMembership.Invite) return;
 
@@ -736,85 +862,82 @@ async function main(): Promise<void> {
     }).catch((error) => {
       console.error(`Failed to join room ${room.roomId}:`, error);
     });
-  });
+  }));
 
-  client.on(sdk.RoomEvent.Timeline, (event, room, toStartOfTimeline) => {
-    if (!room) return;
-    if (toStartOfTimeline) {
-      queueCapture(event, room, toStartOfTimeline);
-      return;
-    }
-    if (event.isEncrypted()) {
-      debugTimeline("queueCapture.await_decrypt", {
-        eventId: event.getId(),
-        roomId: room.roomId,
-      });
-      decryptBridge.attachEncryptedEvent(event, room.roomId);
-      return;
-    }
-    if (
-      event.getType() === "m.room.message" &&
-      !event.isDecryptionFailure() &&
-      decryptBridge.shouldEmitUnencryptedMessage(room.roomId, event.getId() || "")
-    ) {
-      queueCapture(event, room, toStartOfTimeline);
-    }
-  });
+  client.on(
+    sdk.RoomEvent.Timeline,
+    guarded("Room.timeline", (event: MatrixEvent, room: MatrixRoom | undefined, toStartOfTimeline: boolean | undefined) => {
+      if (!room) return;
+      if (toStartOfTimeline) {
+        queueCapture(event, room, toStartOfTimeline);
+        return;
+      }
+      if (event.isEncrypted()) {
+        debugTimeline("queueCapture.await_decrypt", {
+          eventId: event.getId(),
+          roomId: room.roomId,
+        });
+        decryptBridge.attachEncryptedEvent(event, room.roomId);
+        return;
+      }
+      if (
+        event.getType() === "m.room.message" &&
+        !event.isDecryptionFailure() &&
+        decryptBridge.shouldEmitUnencryptedMessage(room.roomId, event.getId() || "")
+      ) {
+        queueCapture(event, room, toStartOfTimeline);
+      }
+    }),
+  );
 
   (
     crypto as unknown as {
       on: (event: string, listener: (request: VerificationRequest) => void) => void;
     }
-  ).on(sdk.CryptoEvent.VerificationRequestReceived, (request: VerificationRequest) => {
-    void handleVerificationRequest(request);
-  });
+  ).on(
+    sdk.CryptoEvent.VerificationRequestReceived,
+    guarded("Crypto.verificationRequestReceived", (request: VerificationRequest) => handleVerificationRequest(request)),
+  );
 
   (
     crypto as unknown as {
       on: (event: string, listener: (...args: unknown[]) => void) => void;
     }
-  ).on("UserTrustStatusChanged", (...args: unknown[]) => {
+  ).on("UserTrustStatusChanged", guarded("Crypto.userTrustStatusChanged", (...args: unknown[]) => {
     console.log("Matrix crypto event: UserTrustStatusChanged", args.length);
-  });
+  }));
 
-  client.once(sdk.ClientEvent.Sync, (state) => {
+  client.once(sdk.ClientEvent.Sync, guarded("Client.sync(once)", (state: string) => {
     if (state === "PREPARED") {
       console.log("Matrix client prepared");
     }
-  });
+  }));
 
-  client.on(sdk.ClientEvent.Sync, (state, prevState, data) => {
+  client.on(sdk.ClientEvent.Sync, guarded("Client.sync", (state: string, prevState: string | null, data: unknown) => {
     if (state === "ERROR") {
       console.warn("Matrix sync entered ERROR state", {
         data,
         prevState,
       });
     }
-  });
+  }));
 
-  client.on(sdk.HttpApiEvent.SessionLoggedOut, (error: unknown) => {
+  client.on(sdk.HttpApiEvent.SessionLoggedOut, guarded("HttpApi.sessionLoggedOut", (error: unknown) => {
     console.warn("Matrix session logged out", error);
-  });
+  }));
 
   await client.startClient({
     initialSyncLimit: 20,
     lazyLoadMembers: true,
   });
-
-  const shutdown = async () => {
-    console.log("Stopping Matrix capture service");
-    client.stopClient();
-    decryptBridge.stop();
-    await decryptBridge.drainPendingDecryptions("matrix capture shutdown");
-    await persistSnapshotOnShutdown();
-    process.exit(0);
-  };
-
-  process.on("SIGINT", shutdown);
-  process.on("SIGTERM", shutdown);
 }
 
-void main().catch((error) => {
-  console.error(error);
+void main().catch((error: unknown) => {
+  // The first line names the cause (refusals carry their own "refusing to start: Gn …" text).
+  console.error(error instanceof Error ? error.message : String(error));
+  // Unexpected errors keep their stack on the following lines.
+  if (error instanceof Error && error.stack && !error.message.startsWith("refusing to start")) {
+    console.error(error.stack);
+  }
   process.exit(1);
 });
