@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "start": "tsx service.ts",
+    "test": "node --import tsx --test *.test.ts",
     "typecheck": "tsc -p tsconfig.json"
   },
   "dependencies": {

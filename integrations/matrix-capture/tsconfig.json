@@ -8,5 +8,6 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["service.ts"]
+  "include": ["*.ts", "test-fixtures/*.ts"],
+  "exclude": ["index.ts"]
 }
