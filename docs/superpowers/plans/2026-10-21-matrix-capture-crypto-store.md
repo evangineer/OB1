@@ -333,7 +333,11 @@
 
 ### Task 9: Per-tenant `roles/ob1`, guarded on-node build, safe reauth, RUNBOOK (dokploy-playbooks)
 
-**Files** (in `~/src/dokploy-playbooks`, new branch `ob1-crypto-store` from `main`):
+**Workspace:**
+- `~/src/dokploy-playbooks` is on branch `operately`, which has unpushed commits and paused Operately tasks. **Do this task in a separate git worktree** (superpowers:using-git-worktrees), so the operator's `--tags operately` applies keep running from the right branch.
+- `RUNBOOK.md` and `group_vars/all/vars.yml` are edited on both branches. Decide the merge order before starting; most likely Operately merges first, and this branch rebases onto it.
+
+**Files** (in that worktree, new branch `ob1-crypto-store`):
 - Modify: `group_vars/all/vars.yml`. Add `ob1_matrix_capture_managed_tenants: [ob1m]` and `ob1_matrix_capture_build_on_node: false`, with comments pointing at the spec.
 - Modify: `roles/ob1/tasks/main.yml` (Codex 2 #2):
   - **Reset first** (Codex 3 #5): at the top of the role, reset `ob1_matrix_capture_users_resolved`, the room mappings and the per-tenant dicts to empty.
@@ -395,7 +399,9 @@ Every bullet that changes production needs the operator's go-ahead first.
     - ob1s unchanged.
 - [ ] **Step 5: Preflight on a scratch session.**
   - Log in with the vaulted ob1m password. Expected: 200.
-  - **Identical re-upload test:** `POST /keys/upload` with one `signed_curve25519:AAAAAAAAAAA` key twice, with a byte-identical body. Expected: 200 both times. Any 400 means stop: G5's crash-replay assumption is false.
+  - **Identical re-upload test:** `POST /keys/upload` twice, with a byte-identical, well-formed body: `{"one_time_keys":{"signed_curve25519:AAAAAAAAAAA":{"key":"<base64>","signatures":{"<scratch user>":{"ed25519:<scratch device>":"<base64>"}}}}}`. Synapse doesn't verify one-time-key signatures. Expected: 200 both times.
+    - **A 400 on the first POST** means the probe itself is malformed: fix it and retry. It says nothing about G5.
+    - **Only a 400 on the second POST**, with `already exists`, means G5's crash-replay assumption is false. Stop.
   - Log out. Expected: 200, and the scratch device and its keys are gone.
 - [ ] **Step 6: Rotate.** Run `ansible-playbook reauth-ob1-matrix.yml -e tenant=ob1m`.
   - Verify the new device (RUNBOOK :1064-1112).
