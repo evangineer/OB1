@@ -1,6 +1,6 @@
 # Design: matrix-capture crypto-store integrity
 
-Status: approved 2026-10-21. Revised the same day after a Codex (GPT-6.1-Sol) review; changes are marked "Codex review #n". Implementation plan follows (superpowers:writing-plans); built test-first.
+Status: approved 2026-10-21. Revised the same day after two Codex (GPT-6.1-Sol) reviews; changes are marked "Codex review #n" (first pass) or "Codex review 2, #n" (second pass). Implementation plan follows (superpowers:writing-plans); built test-first.
 Nothing touches production until the rollout steps (§7), and each step there is operator-gated.
 
 The spec spans three repos:
@@ -61,7 +61,7 @@ The capture bot must **never operate on crypto state that differs from what the 
   - If the server has no keys for this device (a brand-new device), continue.
   - This invariant catches every route to the bug, not just the lock.
   - **The server's keys must come from a raw `POST /keys/query`.** Compare them with `crypto.getOwnDeviceKeys()`. Don't use the SDK's device APIs: Rust crypto seeds its device store with our own device from the local account, so the comparison would always pass.
-  - **When:** right after `initRustCrypto` and before `bootstrapCrossSigning()` (`service.ts:704`), because that call already sends requests.
+  - **When:** right after `initRustCrypto` and before `bootstrapCrossSigning()` (`service.ts:704`), because that call already sends requests. `getOwnDeviceKeys()` returns a promise and must be awaited.
   - **Startup gate (Codex review #3):**
     - The `RustCrypto` constructor already starts `checkKeyBackupAndEnable()` (`rust-crypto.js:119`). A trusted backup can therefore start uploading during `initRustCrypto`, before G1 has given its verdict.
     - A closed gate is installed **before** `initRustCrypto`. Until G1 passes, every outgoing crypto request (G5's hook) and every snapshot save waits at the gate.
@@ -75,21 +75,23 @@ The capture bot must **never operate on crypto state that differs from what the 
   - **A restore can't hang (Codex review #7).** Restore rejects on transaction `abort` or `error` and on a `blocked` open, and closes connections in `finally`. Any such failure is a G2 refusal, never a hung start.
 - **G3. Saves are consistent, atomic and durable.**
   - **Consistent:** each database is dumped in **one** read-only transaction covering all its object stores. Today `dumpIndexedDatabases` opens one transaction per store (`idb-persistence.ts:150`), so a multi-store Rust write can land between two reads and tear the snapshot.
-  - Write to a temp file in the same directory, **created with mode 0600 before any data is written**, then fsync it, rename it over the snapshot, and fsync the directory.
+  - Write to a temp file in the same directory: delete any leftover `.tmp`, then create a new one **exclusively** (`wx`) with mode 0600 before writing any data. Then fsync it, rename it over the snapshot, and fsync the directory. Reusing a leftover file could keep looser permissions (Codex review 2, #6).
   - A crash at any point leaves either the old snapshot or the new one, never a torn file.
-- **G4. One writer per store, with a lifetime lease (revised after Codex review #4).**
-  - **Why not a per-save lock:** the age of a single save's lock doesn't prove its owner is dead. A paused process or a clock jump could let its lock be stolen, and the existing unconditional cleanup could then delete the new owner's lock. Separate processes also each hold their own in-memory store, so two writers on one volume are wrong whatever the locking.
-  - **The lease:**
-    - At startup, before the restore, the process takes the lock directory `<snapshot>.lock` and writes `owner.json` with `{ pid, hostname, token, acquiredAt }`. `token` is a random value unique to this process.
-    - It **refreshes** the lease (updates the mtime of `owner.json`) every 10 s for its whole lifetime.
-    - It releases the lease on shutdown, and only if `owner.json` still holds its own token.
-  - **Taking over a stale lease:**
-    - A lease counts as stale only when it hasn't been refreshed for 60 s, or its mtime is more than 60 s in the future (clock skew).
-    - A stale lease is removed with a warning naming the previous owner and its age, then acquisition is retried.
-    - A lock with no `owner.json` (the 3 May locks) is judged by the lock directory's own mtime.
-  - **A live lease blocks startup:** `refusing to start: G4 snapshot lease held by <hostname>/<pid>`. A second process on the same volume can never write.
-  - **Losing the lease is fatal.** Before every save, the process checks `owner.json` still holds its token. If not, it exits non-zero with `G4 lease lost`, without writing.
+- **G4. One writer per store, enforced by a kernel lock (revised after both Codex reviews).**
+  - **Why not a file lock with a lease:** no lock made of files and timestamps can tell a paused process from a dead one. A paused writer can resume after a takeover and rename a stale snapshot over the new one (Codex review 2, Critical 1). Separate processes also each hold their own in-memory store, so two writers on one volume are wrong whatever the locking.
+  - **The lock:** the container entrypoint (`entrypoint.sh`) does these three things, in order:
+    1. opens `<MATRIX_INDEXEDDB_PATH>/.writer.lock` on file descriptor 9;
+    2. takes `flock -n 9` (non-blocking);
+    3. `exec`s node, so node is the same process and inherits the lock.
+  - **Why this holds:**
+    - The kernel releases the lock only when the process exits, including on SIGKILL. A live process can never lose it, and a dead one never leaves it behind.
+    - It works across containers on the same host sharing a local volume. That is our case: the stack is pinned to `dokploy-main-12bl5`.
+    - `flock` is unreliable on network filesystems, which these volumes are not.
+  - **If the lock is held:** the entrypoint prints `refusing to start: G4 another writer holds <path>` and exits 75.
+  - **Node checks it is running under the lock.** At startup, node runs `flock -n <path> true` in a child process. If the child *gets* the lock, nobody holds it, so the service wasn't started through the entrypoint: `refusing to start: G4 not running under the writer lock`.
+  - **Legacy lock directories:** under the kernel lock, any `<snapshot>.lock/` directory (the 3 May ones) is stale by definition. It is removed with a warning.
   - Within the process, saves are serialised by an in-process mutex.
+  - **Other writers take the same lock:** the reauth playbook wipes the volume only while holding it (§7.3).
 - **G5. Durable before publish.**
   - **Outgoing:** the crypto store snapshot must be on disk before any outgoing request that publishes or commits crypto state is sent: `/keys/upload`, `/keys/signatures/upload`, `/keys/device_signing/upload`, `sendToDevice`, and room-key backup uploads.
   - **Where to hook:** every one of these goes through `OutgoingRequestProcessor.prototype.makeOutgoingRequest` (`node_modules/matrix-js-sdk/lib/rust-crypto/OutgoingRequestProcessor.js:51-90`).
@@ -130,7 +132,12 @@ The capture bot must **never operate on crypto state that differs from what the 
   - **Tags (Codex review #8):** the workflow derives the tag itself as `<version>-<sha7 of the checked-out commit>`, and fails if that tag already exists. No `latest`.
   - **CI and the image install the same dependencies:** the Dockerfile copies `package-lock.json` and runs `npm ci`, as the CI test step does.
   - **Each tenant pins its own image by digest:** `dokploy-stacks/ob1-ob1m/docker-compose.yml` references `ghcr.io/evangineer/ob1-matrix-capture:<tag>@sha256:<digest>`. Each tenant deploys independently through Dokploy.
-  - **Role scoping (Codex review #2):** `roles/ob1` acts only on the tenants listed in `ob1_matrix_capture_managed_tenants`, set to `[ob1m]` until Sofia agrees. That covers env file writes, change detection, redeploy webhooks, rollover verification and force-updates. A role run or a reauth follow-up can then never redeploy or rewrite ob1s.
+  - **Role scoping (Codex reviews 1 #2 and 2 #2):** `roles/ob1` acts only on the tenants listed in `ob1_matrix_capture_managed_tenants`, set to `[ob1m]` until Sofia agrees.
+    - The users list is filtered **first**, so room creation, the Matrix env files and the MCP env files all skip ob1s.
+    - Services are mapped by tenant name rather than list position, with an assertion of exactly one service per managed tenant.
+    - Change detection, redeploy webhooks, rollover checks and force-updates are all per tenant.
+    - A role run or a reauth follow-up can then never redeploy or rewrite ob1s.
+  - **CI publication:** one workflow `concurrency` group per tag, and a registry error is a failure, not "tag absent".
   - **ob1s:** its stack file stays on `ob1-matrix-capture:current` until Sofia agrees. Nothing re-tags `:current`.
   - **Remove the on-node build from `dokploy-playbooks/roles/ob1`:** the source sync, `docker build` (`main.yml:97`) and the `docker service update --force` fan-out (`:373`). Do this only after ob1s has also moved off `:current`; until then those tasks are guarded off, so a role run can't rebuild or restart either tenant.
   - **Package visibility (*my call*):** **public**. The source is public, and the image holds no secrets because they arrive via `env_file`. Nodes then pull without registry credentials. If it must be private, Dokploy needs a GHCR registry credential instead.
@@ -146,7 +153,7 @@ The capture bot must **never operate on crypto state that differs from what the 
 
 - Any code path that starts crypto on an empty or partial store while a snapshot file exists.
 - Any code path that overwrites the snapshot before a successful restore.
-- Deleting a lease whose owner is still refreshing it, or two processes writing the same store.
+- Two processes writing the same store, or a writer that keeps writing after another has started.
 - Acknowledging (via the next `/sync`) to-device messages whose processing failed.
 - Any publish or save before G1 has passed.
 - Logging secrets. That includes snapshot contents, keys and recovery-key material. Keep the existing `no_log`-style discipline, and keep the key-upload diagnostics behind `MATRIX_CRYPTO_DEBUG`.
@@ -166,18 +173,18 @@ The capture bot must **never operate on crypto state that differs from what the 
 ## 6. Tests required (written first, watched failing)
 
 `idb-persistence.test.ts`, run against temp directories:
-1. **Lease:**
-   - A stale lease is taken over with a warning, including an ownerless legacy lock and a future-dated one.
-   - A live, refreshed lease refuses startup and is left intact.
-   - Release never removes another owner's lease.
-   - A save after the lease was taken over fails with `G4 lease lost` and writes nothing.
+1. **Writer lock (two processes):**
+   - With one process holding the lock through the entrypoint, a second start exits 75 with the G4 message.
+   - After the first is SIGKILLed, a new start succeeds.
+   - Node started without the entrypoint refuses with `G4 not running under the writer lock`.
+   - A legacy `.lock/` directory is removed with a warning.
 2. **Atomic write:**
    - A simulated failure between the temp write and the rename leaves the old snapshot byte-identical.
-   - The temp file and the final file are 0600.
+   - The temp file and the final file are 0600, including when a 0644 `.tmp` was left behind.
 3. **Failure reporting:** the persist result reports failure, so the caller can't log success.
 4. **Restore outcomes:**
    - Restore returns distinct results for "no snapshot", "restored" and "failed".
-   - A well-formed snapshot that fails during insertion returns "failed", not a hang.
+   - A well-formed snapshot that fails during insertion returns "failed", not a hang. So do a `blocked` open and a transaction `error`.
 5. **Consistent dump:** the conflicting write is queued deterministically between the reads of the two stores. The restore goes into a fresh, injected factory. The test must fail against the old per-store dump.
 
 A new module (name left to the builder) holds the startup and publish logic as pure functions, with tests:
@@ -196,8 +203,12 @@ A new module (name left to the builder) holds the startup and publish logic as p
    - A save requested while one is in flight waits for it, never skips.
    - The incoming rule, tested against the **real `SyncApi`** with a fake HTTP layer: while the save is pending, no second `/sync` is sent.
    - The same harness: a rejecting `preprocessToDeviceMessages` means no save, exit non-zero, and no second `/sync`.
-   - **Startup gate:** with a trusted backup present and a delayed G1, no outgoing request or save happens before the gate opens.
-   - The real WASM request classifier recognises each publishing request class.
+   - **Startup gate (Codex review 2, #4):**
+     - The startup sequence lives in its own module, which takes its dependencies as parameters.
+     - A fake `initRustCrypto` fires a real backup upload request through the real outgoing-request path during init.
+     - That request waits at the gate. It is never sent if G1 refuses, and is sent once G1 passes.
+     - **Limit:** crypto migration from a legacy store would deadlock behind the gate, because it awaits a request during init. The service never configures a legacy store, so this doesn't arise.
+   - The real WASM request classifier recognises each publishing request class. Where the library exposes a constructor, each class is built directly; otherwise it comes from `outgoingRequests()`.
    - One test against the real SDK and fake-indexeddb: after an OTK upload request is produced and a snapshot is taken, restoring that snapshot into a fresh process yields the same one-time keys.
 9. **Save-failure escalation (G6):** the warn → error → exit thresholds. Shutdown exits non-zero when its final save fails.
 
@@ -209,11 +220,14 @@ Plus `npm run typecheck`, with `tsconfig.json` extended so the new modules and t
    - **ob1s's volume holds Sofia's Olm private keys.** Copying it is copying her credentials, so the ob1s backup is part of the consent request in step 5. Until she agrees, the only copy of her 3 May snapshot is the one on the node, which nothing touches.
 2. **Publish the fixed image from CI (G8), then switch ob1m's stack to that tag and deploy it through Dokploy.**
    - First guard off the on-node build and restart tasks in `roles/ob1`, and scope the role to `[ob1m]`, so no role run can touch ob1s.
-   - **Expected:** G4 takes over the stale lock and G2 restores the 3 May snapshot. Then G1 refuses with `G1 device-key mismatch`, because the server holds the 9 Oct keys. That confirms both checks live.
+   - **Expected:** G4 removes the legacy lock directory and G2 restores the 3 May snapshot. Then G1 refuses with `G1 device-key mismatch`, because the server holds the 9 Oct keys. That confirms both checks live.
    - **Debug flags:** `ob1_matrix_crypto_debug` and `ob1_matrix_timeline_debug` are on in production (`group_vars/all/vars.yml`). *My call:* leave them on until §7.4 passes, then turn them off. They only log public key material, but they're noisy.
 3. **Rotate ob1m to a new device** with `reauth-ob1-matrix.yml -e tenant=ob1m`.
    - **The login path still exists.** Synapse has `password_config.enabled: true` (`roles/synapse/templates/homeserver.yaml.j2:116`), and the playbook logs in with `m.login.password` (`reauth-ob1-matrix.yml:86-98`), which creates a fresh device ID.
-   - **Preflight:** confirm the vaulted password still logs in, then log out that test session at once. If it fails, stop and come back.
+   - **Preflight:** confirm the vaulted password still logs in. If it fails, stop and come back.
+     - The scratch session then uploads one one-time key twice with an identical body and expects 200 both times. This directly verifies that Synapse accepts an identical re-upload.
+     - Then log out, which deletes the scratch device and its keys.
+   - **Stop barrier (Codex review 2, #5):** after scaling the service to 0, wait until its container has exited, and fail on timeout. Then back up and wipe the store from inside `flock -n` on `.writer.lock`, which proves no bot is running.
    - Then verify the new device (RUNBOOK :1064-1112).
    - Then sign out `OB1M05`.
    - Change: the playbook's store wipe gets a backup step before `rm -rf`.
@@ -221,7 +235,8 @@ Plus `npm run typecheck`, with `tsconfig.json` extended so the new modules and t
    - two restarts give no "already exists" in the Synapse log. This is also the live check that Synapse accepts an identical one-time-key re-upload;
    - the snapshot mtime advances after each restart;
    - an encrypted test message from a MindRoom agent is captured;
-   - after a stale lock is planted with a backdated mtime and the bot restarted, the lock is cleared and logged.
+   - a planted legacy `.lock/` directory is removed with a warning on restart;
+   - a second container started by hand on the same volume refuses with the G4 message.
 5. **ob1s:** the same steps, only after Sofia agrees.
    - Until then its stack stays on the local `:current` image and keeps capturing partially, with nothing touching it.
    - The risk it already carries remains: any unplanned restart repeats the empty-store start.
