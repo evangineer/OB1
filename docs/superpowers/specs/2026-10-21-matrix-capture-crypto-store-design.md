@@ -223,7 +223,11 @@ A new module (name left to the builder) holds the startup and publish logic as p
      - The startup sequence lives in its own module, which takes its dependencies as parameters.
      - A fake `initRustCrypto` fires a real backup upload request through the real outgoing-request path during init.
      - That request waits at the gate. It is never sent if G1 refuses, and is sent once G1 passes.
-     - **Limit:** crypto migration from a legacy store would deadlock behind the gate, because it awaits a request during init. The service never configures a legacy store, so this doesn't arise.
+     - **Limit:** crypto migration from a legacy store would deadlock behind the gate, because it awaits a request during init.
+       - **This premise was false (found during Task 7):** in a process with `globalThis.indexedDB`, matrix-js-sdk's `browser-index` installs an `IndexedDBCryptoStore("matrix-js-sdk:crypto")` by default. On restart, `initRustCrypto` then awaited an own-key `/keys/query` held by the gate, so startup hung and node exited 0.
+       - **Requirement:** the service passes `cryptoStore: new MemoryCryptoStore()` to `createClient`. That store is used only for libolm migration, so the Rust store's location and contents are unchanged. Do not remove it.
+       - A `beforeExit` guard exits 1 with a named line, so any future hang that drains the event loop can't exit 0.
+       - Existing snapshots may still carry the dead `matrix-js-sdk:crypto` database. It is harmless; leave it.
    - The real WASM request classifier recognises each publishing request class. Where the library exposes a constructor, each class is built directly; otherwise it comes from `outgoingRequests()`.
    - One test against the real SDK and fake-indexeddb: after an OTK upload request is produced and a snapshot is taken, restoring that snapshot into a fresh process yields the same one-time keys.
 9. **Save-failure escalation (G6):** the warn → error → exit thresholds. Shutdown exits non-zero when its final save fails.
