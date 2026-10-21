@@ -382,16 +382,20 @@ Every bullet that changes production needs the operator's go-ahead first.
   Expected: the archive lists the snapshot dated 2026-05-03.
 - [ ] **Step 2: Merge and apply Task 9** (dokploy-playbooks).
   Expected: nothing changes for ob1s, and ob1s's task ID is unchanged.
-- [ ] **Step 3: Publish the image.**
+- [ ] **Step 3: Publish the image.** (Order revised after the final review: GitHub only dispatches workflows whose file exists on the default branch.)
   - Push the OB1 branch.
-  - Dispatch the workflow with `version=0.2.0`.
+  - Land `.github/workflows/matrix-capture-image.yml` on the fork's default branch (`main`) first, for example via a small PR containing only that file.
+  - Dispatch on the feature branch: `gh workflow run matrix-capture-image.yml --ref matrix-capture-crypto-store -f version=0.2.0`. The tag's sha7 is then the branch head.
+  - If the first run fails at the existence check with `denied` (the package doesn't exist yet), stop and decide with the operator (ruling R18). Don't loosen the check.
   - Make the package public.
   Expected: the summary shows the tag and an arm64 digest.
 - [ ] **Step 4: Pin ob1m's stack.** In `~/src/dokploy-stacks/ob1-ob1m/docker-compose.yml`:
   - `image: ghcr.io/evangineer/ob1-matrix-capture:<tag>@sha256:<digest>`;
   - `stop_grace_period: 30s`;
   - `init: true`.
+  - `stop_grace_period: 30s` and `init: true` are **hard prerequisites**, not optional extras. Without `init`, node is PID 1 and handles signals only through its own handlers.
   Commit it. Pushing to `main` redeploys via Dokploy.
+  - Verify: `docker service inspect <svc> --format '{{.Spec.TaskTemplate.ContainerSpec.Init}} {{.Spec.TaskTemplate.ContainerSpec.StopGracePeriod}}'` shows `true 30000000000`.
   - **Expected:**
     - the logs show `legacy snapshot lock` removed and a successful restore;
     - then `refusing to start: G1 device-key mismatch for @evangineer…/OB1M05`;
