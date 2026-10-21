@@ -146,3 +146,11 @@ test("persist reports failure when the directory is unwritable", async () => {
   });
   assert.equal(res.ok, false);
 });
+
+test("restore fails on a present but empty or non-array snapshot", async () => {
+  for (const payload of [[], {}]) {
+    const file = writeSnapshot(tmpDir(), payload);
+    const res = await restoreIdbFromDisk(file, { factory: new IDBFactory(), log: quiet });
+    assert.equal(res.status, "failed");
+  }
+});

@@ -265,7 +265,7 @@ export async function restoreIdbFromDisk(
     const data = fs.readFileSync(snapshotPath);
     const snapshot = parseSnapshotPayload(data);
     if (!snapshot) {
-      return { status: "absent" };
+      throw new Error("empty or non-array snapshot");
     }
     await restoreIndexedDatabases(idb, snapshot);
     return { status: "restored", databases: snapshot.length };
