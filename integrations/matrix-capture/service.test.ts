@@ -156,6 +156,31 @@ test("refuses when /keys/query fails (Review Focus 4)", { timeout: 90_000 }, asy
   assert.equal(fs.existsSync(snapshotPath), false, "no snapshot saved");
 });
 
+test("SIGTERM during a stalled startup exits promptly without saving (G1/G7)", { timeout: 90_000 }, async (t) => {
+  // The homeserver holds /keys/query open, so startup is blocked inside the G1 check.
+  const { hs, dataDir, snapshotPath } = await setup(t, {
+    "^POST .*/keys/query$": () => new Promise<never>(() => {}),
+  });
+
+  const { child, done } = startService(hs, dataDir);
+  await Promise.race([
+    hs.waitForRequests(/\/keys\/query$/, 1),
+    done.then((run) => assert.fail(`service exited early: ${describe(run)}`)),
+  ]);
+  const killedAt = Date.now();
+  child.kill("SIGTERM");
+  const run = await done;
+  const elapsed = Date.now() - killedAt;
+
+  assert.equal(run.code, 1, describe(run));
+  assert.ok(elapsed < 5_000, `exited ${elapsed}ms after SIGTERM: ${describe(run)}`);
+  assert.match(run.output, /^received SIGTERM during startup; exiting$/m, describe(run));
+  assert.equal(firstRefusal(run.output), undefined, describe(run));
+  assert.doesNotMatch(run.output, /Stopping Matrix capture service/, describe(run));
+  assert.deepEqual(publishRequests(hs), [], "nothing published");
+  assert.equal(fs.existsSync(snapshotPath), false, "no snapshot saved");
+});
+
 test("a new device saves before publishing, exits 0 on SIGTERM, and restarts on its restored store (G1/G2/G5/G7)", { timeout: 150_000 }, async (t) => {
   let snapshotPath = "";
   const snapshotAtUpload: boolean[] = [];
@@ -169,7 +194,7 @@ test("a new device saves before publishing, exits 0 on SIGTERM, and restarts on 
       return { body: { one_time_key_counts: { signed_curve25519: 50 } } };
     },
     "^POST .*/keys/query$": () => ({
-      body: { device_keys: uploadedDeviceKeys ? { [userId]: { [deviceId]: uploadedDeviceKeys } } : {}, failures: {} },
+      body: { device_keys: { [userId]: uploadedDeviceKeys ? { [deviceId]: uploadedDeviceKeys } : {} }, failures: {} },
     }),
   });
   snapshotPath = sp;

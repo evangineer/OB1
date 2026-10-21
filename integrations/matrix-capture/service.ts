@@ -627,6 +627,17 @@ process.on("beforeExit", () => {
   process.exit(1);
 });
 
+// Until the real shutdown handlers are installed, a stop signal just exits: the startup gate is
+// still closed, so nothing has been published and there is nothing to save. Without this, node's
+// default action would kill the process silently, and a stalled startup step would hide the cause.
+const startupSignalExit = (signal: NodeJS.Signals): void => {
+  shuttingDown = true;
+  console.error(`received ${signal} during startup; exiting`);
+  process.exit(1);
+};
+process.on("SIGINT", startupSignalExit);
+process.on("SIGTERM", startupSignalExit);
+
 async function main(): Promise<void> {
   const sdk = await loadMatrixSdk();
   await installRustCryptoDiagnostics();
@@ -821,6 +832,8 @@ async function main(): Promise<void> {
       },
     );
   };
+  process.off("SIGINT", startupSignalExit);
+  process.off("SIGTERM", startupSignalExit);
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 

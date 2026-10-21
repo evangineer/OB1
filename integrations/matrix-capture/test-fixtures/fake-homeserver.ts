@@ -5,8 +5,11 @@ import type { AddressInfo } from "node:net";
 
 export type FakeRequest = { method: string; path: string };
 export type FakeResponse = { status?: number; body: unknown };
-/** Keyed by a regex source matched against `"<METHOD> <path>"`, e.g. `"GET /room_keys/version$"`. */
-export type FakeHandlers = Record<string, (req: FakeRequest & { body: unknown }) => FakeResponse>;
+/**
+ * Keyed by a regex source matched against `"<METHOD> <path>"`, e.g. `"GET /room_keys/version$"`.
+ * A handler may return a promise; one that never settles holds the request open.
+ */
+export type FakeHandlers = Record<string, (req: FakeRequest & { body: unknown }) => FakeResponse | Promise<FakeResponse>>;
 
 export type FakeHomeserver = {
   url: string;
@@ -60,7 +63,8 @@ export async function startFakeHomeserver(
     if (method === "POST" && /\/user\/[^/]+\/filter$/.test(path)) return { body: { filter_id: "1" } };
     if (/\/pushrules\/?$/.test(path)) return { body: { global: {} } };
     if (/\/capabilities$/.test(path)) return { body: { capabilities: {} } };
-    if (/\/keys\/query$/.test(path)) return { body: { device_keys: {}, failures: {} } };
+    // Lists the user with no devices: a device that has uploaded no keys (G1 treats it as new).
+    if (/\/keys\/query$/.test(path)) return { body: { device_keys: { [identity.userId]: {} }, failures: {} } };
     if (/\/keys\/upload$/.test(path)) {
       const otks = (body as { one_time_keys?: Record<string, unknown> } | undefined)?.one_time_keys ?? {};
       uploadedOtks += Object.keys(otks).length;
@@ -82,7 +86,7 @@ export async function startFakeHomeserver(
     let response: FakeResponse;
     const key = `${method} ${path}`;
     const custom = Object.keys(handlers).find((k) => new RegExp(k).test(key));
-    response = custom ? handlers[custom]!({ method, path, body }) : await defaultRoute(method, path, body);
+    response = custom ? await handlers[custom]!({ method, path, body }) : await defaultRoute(method, path, body);
     if (closed || res.destroyed) return;
     res.writeHead(response.status ?? 200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(response.body ?? {}));

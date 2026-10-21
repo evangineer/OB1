@@ -38,15 +38,32 @@ export function checkDeviceIdentity(p: {
   };
 }
 
+// Network-failure detail for a refusal: the error's message plus its cause's code (or message).
+// Never includes request headers, so the access token cannot leak.
+function fetchErrorDetail(err: unknown): string {
+  const message = errMessage(err);
+  const cause = err instanceof Error ? (err as Error & { cause?: unknown }).cause : undefined;
+  if (cause === undefined || cause === null) return message;
+  const code = (cause as { code?: unknown }).code;
+  const detail = typeof code === "string" && code ? code : errMessage(cause);
+  return detail && detail !== message ? `${message} (${detail})` : message;
+}
+
 export async function fetchServerDeviceKeys(p: {
   homeserverUrl: string;
   accessToken: string;
   userId: string;
   deviceId: string;
   fetchImpl?: typeof fetch;
+  /** Bounds the whole request, body included; a stalled homeserver must not hang startup. */
+  timeoutMs?: number;
 }): Promise<Record<string, string> | undefined> {
   const prefix = "refusing to start: G1 could not verify device keys";
   const doFetch = p.fetchImpl ?? fetch;
+  const timeoutMs = p.timeoutMs ?? 30_000;
+  const signal = AbortSignal.timeout(timeoutMs);
+  const fail = (err: unknown): Error =>
+    new Error(`${prefix}: ${signal.aborted ? `timeout after ${timeoutMs}ms` : fetchErrorDetail(err)}`);
   const url = `${p.homeserverUrl.replace(/\/+$/, "")}/_matrix/client/v3/keys/query`;
   let res: Response;
   try {
@@ -57,9 +74,10 @@ export async function fetchServerDeviceKeys(p: {
         "Content-Type": "application/json",
       },
       body: JSON.stringify({ device_keys: { [p.userId]: [p.deviceId] } }),
+      signal,
     });
   } catch (err) {
-    throw new Error(`${prefix}: ${errMessage(err)}`);
+    throw fail(err);
   }
   if (!res.ok) {
     throw new Error(`${prefix}: ${res.status}`);
@@ -68,10 +86,25 @@ export async function fetchServerDeviceKeys(p: {
   try {
     body = await res.json();
   } catch (err) {
-    throw new Error(`${prefix}: ${errMessage(err)}`);
+    throw fail(err);
   }
-  const keys = body.device_keys?.[p.userId]?.[p.deviceId]?.keys;
-  return keys ? { ...keys } : undefined;
+  // Fail closed: a response that does not list the user proves nothing about the device.
+  const devices = body?.device_keys?.[p.userId];
+  if (!devices || typeof devices !== "object") {
+    throw new Error(`${prefix}: response missing user`);
+  }
+  // Synapse omits devices that have not uploaded keys: that is a new device (the reauth path).
+  const device = devices[p.deviceId];
+  if (device === undefined) return undefined;
+  const keys = device?.keys;
+  if (
+    !keys ||
+    typeof keys[`ed25519:${p.deviceId}`] !== "string" ||
+    typeof keys[`curve25519:${p.deviceId}`] !== "string"
+  ) {
+    throw new Error(`${prefix}: response missing device keys`);
+  }
+  return { ...keys };
 }
 
 export class StartupGate {

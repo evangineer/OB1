@@ -92,6 +92,67 @@ test("fetchServerDeviceKeys throws on network failure", async () => {
   );
 });
 
+test("fetchServerDeviceKeys refuses a 200 response that omits the user", async () => {
+  const fetchImpl = (async () => new Response(JSON.stringify({}), { status: 200 })) as unknown as typeof fetch;
+  await assert.rejects(
+    fetchServerDeviceKeys({ ...base, fetchImpl }),
+    /^Error: refusing to start: G1 could not verify device keys: response missing user$/,
+  );
+});
+
+test("fetchServerDeviceKeys refuses a listed device that lacks a curve25519 key", async () => {
+  const fetchImpl = (async () =>
+    new Response(JSON.stringify({ device_keys: { [userId]: { [deviceId]: { keys: { "ed25519:DEV": "a" } } } } }), {
+      status: 200,
+    })) as unknown as typeof fetch;
+  await assert.rejects(
+    fetchServerDeviceKeys({ ...base, fetchImpl }),
+    /^Error: refusing to start: G1 could not verify device keys: response missing device keys$/,
+  );
+});
+
+test("fetchServerDeviceKeys refuses a listed device that lacks an ed25519 key", async () => {
+  const fetchImpl = (async () =>
+    new Response(JSON.stringify({ device_keys: { [userId]: { [deviceId]: { keys: { "curve25519:DEV": "b" } } } } }), {
+      status: 200,
+    })) as unknown as typeof fetch;
+  await assert.rejects(
+    fetchServerDeviceKeys({ ...base, fetchImpl }),
+    /^Error: refusing to start: G1 could not verify device keys: response missing device keys$/,
+  );
+});
+
+test("fetchServerDeviceKeys times out a stalled request", async () => {
+  // Keeps the event loop alive: the abort timer alone is unref'd.
+  const guard = setTimeout(() => {}, 5_000);
+  const fetchImpl = ((_url: string, init: RequestInit) =>
+    new Promise((_resolve, reject) => {
+      init.signal?.addEventListener("abort", () => reject(init.signal?.reason));
+    })) as unknown as typeof fetch;
+  const started = Date.now();
+  try {
+    await assert.rejects(
+      fetchServerDeviceKeys({ ...base, fetchImpl, timeoutMs: 50 }),
+      /^Error: refusing to start: G1 could not verify device keys: timeout after 50ms$/,
+    );
+  } finally {
+    clearTimeout(guard);
+  }
+  assert.ok(Date.now() - started < 2_000, "rejected within the timeout");
+});
+
+test("fetchServerDeviceKeys includes the network error cause", async () => {
+  const fetchImpl = (async () => {
+    throw new TypeError("fetch failed", { cause: Object.assign(new Error("connect ECONNREFUSED 127.0.0.1:9"), { code: "ECONNREFUSED" }) });
+  }) as unknown as typeof fetch;
+  await assert.rejects(
+    fetchServerDeviceKeys({ ...base, fetchImpl }),
+    (e: Error) =>
+      e.message === "refusing to start: G1 could not verify device keys: fetch failed (ECONNREFUSED)" &&
+      !e.message.includes("SECRETTOKEN"),
+  );
+});
+
 test("StartupGate.wait stays pending until open", async () => {
   const gate = new StartupGate();
   let resolved = false;
