@@ -139,32 +139,39 @@ async function dumpIndexedDatabases(
     });
 
     const stores: IdbStoreSnapshot[] = [];
-    for (const storeName of db.objectStoreNames) {
-      const tx = db.transaction(storeName, "readonly");
-      const store = tx.objectStore(storeName);
-      const storeInfo: IdbStoreSnapshot = {
-        name: storeName,
-        keyPath: store.keyPath as IDBObjectStoreParameters["keyPath"],
-        autoIncrement: store.autoIncrement,
-        indexes: [],
-        records: [],
-      };
-      for (const idxName of store.indexNames) {
-        const idx = store.index(idxName);
-        storeInfo.indexes.push({
-          name: idxName,
-          keyPath: idx.keyPath,
-          multiEntry: idx.multiEntry,
-          unique: idx.unique,
-        });
+    try {
+      const storeNames = [...db.objectStoreNames];
+      if (storeNames.length > 0) {
+        // One readonly transaction over every store gives a consistent view.
+        const tx = db.transaction(storeNames, "readonly");
+        for (const storeName of storeNames) {
+          const store = tx.objectStore(storeName);
+          const storeInfo: IdbStoreSnapshot = {
+            name: storeName,
+            keyPath: store.keyPath as IDBObjectStoreParameters["keyPath"],
+            autoIncrement: store.autoIncrement,
+            indexes: [],
+            records: [],
+          };
+          for (const idxName of store.indexNames) {
+            const idx = store.index(idxName);
+            storeInfo.indexes.push({
+              name: idxName,
+              keyPath: idx.keyPath,
+              multiEntry: idx.multiEntry,
+              unique: idx.unique,
+            });
+          }
+          const keys = await idbReq(store.getAllKeys());
+          const values = await idbReq(store.getAll());
+          storeInfo.records = keys.map((k, i) => ({ key: k, value: values[i] }));
+          stores.push(storeInfo);
+        }
       }
-      const keys = await idbReq(store.getAllKeys());
-      const values = await idbReq(store.getAll());
-      storeInfo.records = keys.map((k, i) => ({ key: k, value: values[i] }));
-      stores.push(storeInfo);
+    } finally {
+      db.close();
     }
     snapshot.push({ name, version, stores });
-    db.close();
   }
   return snapshot;
 }
@@ -275,22 +282,73 @@ export async function restoreIdbFromDisk(
   }
 }
 
+function fsyncDirectory(dir: string): void {
+  let fd: number;
+  try {
+    fd = fs.openSync(dir, "r");
+  } catch (error) {
+    if (isIgnorableDirSyncError(error)) {
+      return;
+    }
+    throw error;
+  }
+  try {
+    fs.fsyncSync(fd);
+  } catch (error) {
+    if (!isIgnorableDirSyncError(error)) {
+      throw error;
+    }
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+function isIgnorableDirSyncError(error: unknown): boolean {
+  const code = (error as NodeJS.ErrnoException | undefined)?.code;
+  return code === "EISDIR" || code === "EINVAL" || code === "EPERM";
+}
+
+function writeSnapshotAtomically(
+  snapshotPath: string,
+  data: Buffer,
+  beforeRename?: () => void,
+): void {
+  const tmp = `${snapshotPath}.tmp`;
+  fs.rmSync(tmp, { force: true });
+  const fd = fs.openSync(tmp, "wx", 0o600);
+  try {
+    fs.writeFileSync(fd, data);
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
+  beforeRename?.();
+  fs.renameSync(tmp, snapshotPath);
+  fsyncDirectory(path.dirname(snapshotPath));
+}
+
 export async function persistIdbToDisk(
   params: { snapshotPath: string; databasePrefix?: string } & PersistenceOptions,
 ): Promise<PersistResult> {
   const idb = params.factory ?? fakeIndexedDB;
   const log = params.log ?? console;
   const snapshotPath = params.snapshotPath;
+  let tmpCreated = false;
   try {
     fs.mkdirSync(path.dirname(snapshotPath), { recursive: true });
     const snapshot = await dumpIndexedDatabases(idb, params.databasePrefix);
     if (snapshot.length === 0) {
       return { ok: true, databases: 0 };
     }
-    fs.writeFileSync(snapshotPath, v8.serialize(snapshot));
-    fs.chmodSync(snapshotPath, 0o600);
+    tmpCreated = true;
+    writeSnapshotAtomically(snapshotPath, v8.serialize(snapshot), params.beforeRename);
     return { ok: true, databases: snapshot.length };
   } catch (error) {
+    if (tmpCreated) {
+      try {
+        fs.rmSync(`${snapshotPath}.tmp`, { force: true });
+      } catch {}
+    }
     log.warn("Failed to persist IndexedDB snapshot:", error);
     return { ok: false, error };
   }
