@@ -50,6 +50,7 @@ export class SnapshotScheduler {
   #running: Promise<PersistResult> | undefined;
   /** The save queued behind the running one; later callers share it. */
   #queued: Pending | undefined;
+  #poisoned: Error | undefined;
   #failures = 0;
   #failingSince: number | undefined;
   #fatalReported = false;
@@ -65,8 +66,20 @@ export class SnapshotScheduler {
     this.#sleep = opts.sleep ?? ((ms) => new Promise((r) => setTimeout(r, ms)));
   }
 
+  /**
+   * Permanently disables persistence (spec G5: a failed incoming sync is never snapshotted).
+   * Synchronous, so it takes effect before any save or publish that is already waiting can persist.
+   */
+  poison(reason: string): void {
+    if (this.#poisoned) return;
+    this.#poisoned = new Error(`snapshot saves disabled: ${reason}`);
+    this.#log.error(this.#poisoned.message);
+  }
+
   async save(reason: string): Promise<PersistResult> {
+    if (this.#poisoned) return { ok: false, error: this.#poisoned };
     await this.#gate.wait();
+    if (this.#poisoned) return { ok: false, error: this.#poisoned };
     if (this.#queued) {
       if (!this.#queued.reasons.includes(reason)) this.#queued.reasons.push(reason);
       return this.#queued.promise;
@@ -93,6 +106,7 @@ export class SnapshotScheduler {
     for (;;) {
       const result = await this.save(reason);
       if (result.ok) return;
+      if (this.#poisoned) throw this.#poisoned;
       await this.#sleep(delay);
       delay = Math.min(delay * 2, BACKOFF_MAX_MS);
     }
@@ -109,6 +123,7 @@ export class SnapshotScheduler {
   }
 
   async #runOnce(reason: string): Promise<PersistResult> {
+    if (this.#poisoned) return { ok: false, error: this.#poisoned };
     let result: PersistResult;
     try {
       result = await this.#persist();
@@ -165,8 +180,16 @@ export function installPublishDurability(
 type SyncState = { dirty: boolean; failed: boolean };
 /** Per RustCrypto instance (Ruling R3); the hooks live on the prototype. */
 const syncStates = new WeakMap<object, SyncState>();
-/** Prototypes on which installSyncDurability ran. */
-const syncProtos = new WeakSet<object>();
+
+export type SyncDurabilityOptions = {
+  save: () => Promise<void>;
+  onIncomingFailure: (reason: string) => void;
+  /** Called synchronously when an instance's failure latch is set; the service passes `scheduler.poison`. */
+  onLatched?: (reason: string) => void;
+  log?: Pick<Console, "error">;
+};
+/** Options of each prototype on which installSyncDurability ran. */
+const syncProtos = new WeakMap<object, SyncDurabilityOptions>();
 
 function stateOf(instance: object): SyncState {
   let s = syncStates.get(instance);
@@ -184,16 +207,28 @@ type SyncProto = Patchable & {
 
 export const INCOMING_FAILURE = "incoming crypto processing failed";
 
+function setFailedLatch(instance: object, opts: SyncDurabilityOptions): void {
+  stateOf(instance).failed = true;
+  opts.onLatched?.(INCOMING_FAILURE);
+}
+
+/** Never settles: holds the sync loop so it cannot issue (and acknowledge with) another /sync. */
+function holdSyncLoop(): Promise<void> {
+  return new Promise<void>(() => {});
+}
+
 /**
  * Wraps the Rust crypto sync callbacks. A sync that delivered to-device events is saved after the
- * original `onSyncCompleted` and before it returns, which holds back the next /sync. Failed incoming
- * processing reports `onIncomingFailure` and never saves; the returned promise then never settles,
- * so the sync loop cannot acknowledge the unprocessed messages with another /sync.
+ * original `onSyncCompleted` and before it returns, which holds back the next /sync.
+ *
+ * Failed incoming processing sets a per-instance latch and synchronously calls `onLatched` (which
+ * poisons the scheduler, so no save or publish can follow). `onSyncCompleted` then skips the original
+ * (it would kick outgoing requests), reports `onIncomingFailure("incoming crypto processing failed")`
+ * and never settles, so the sync loop cannot acknowledge the unprocessed messages with another /sync.
+ * A rejecting `save()` is fatal in the same way: logged at error, reported through
+ * `onIncomingFailure("snapshot save failed: <message>")`, and the loop is held.
  */
-export function installSyncDurability(
-  proto: object,
-  opts: { save: () => Promise<void>; onIncomingFailure: (reason: string) => void },
-): void {
+export function installSyncDurability(proto: object, opts: SyncDurabilityOptions): void {
   const p = proto as SyncProto;
   if (Object.prototype.hasOwnProperty.call(p, "__ob1DurablePatched")) return;
   const originalPreprocess = p.preprocessToDeviceMessages;
@@ -205,26 +240,34 @@ export function installSyncDurability(
     try {
       return await originalPreprocess.call(this, events);
     } catch (err) {
-      state.failed = true;
+      setFailedLatch(this, opts);
       throw err;
     }
   };
 
+  const log = opts.log ?? console;
   p.onSyncCompleted = async function durableOnSyncCompleted(this: object, syncState: unknown) {
-    await originalCompleted.call(this, syncState);
     const state = stateOf(this);
+    if (!state.failed) await originalCompleted.call(this, syncState);
     if (state.failed) {
       opts.onIncomingFailure(INCOMING_FAILURE);
-      return new Promise<void>(() => {});
+      return holdSyncLoop();
     }
     if (state.dirty) {
-      await opts.save();
+      try {
+        await opts.save();
+      } catch (err) {
+        const reason = `snapshot save failed: ${errMessage(err)}`;
+        log.error(`Matrix sync held: ${reason}`);
+        opts.onIncomingFailure(reason);
+        return holdSyncLoop();
+      }
       state.dirty = false;
     }
   };
 
   Object.defineProperty(p, "__ob1DurablePatched", { value: true });
-  syncProtos.add(p);
+  syncProtos.set(p, opts);
 }
 
 /**
@@ -232,14 +275,15 @@ export function installSyncDurability(
  * before calling `onSyncCompleted` (:788). Latch that on the client's crypto instance.
  */
 export function latchIncomingFailure(client: Pick<MatrixClient, "on" | "getCrypto">, proto: object): void {
-  if (!syncProtos.has(proto)) {
+  const opts = syncProtos.get(proto);
+  if (!opts) {
     throw new Error("latchIncomingFailure: installSyncDurability has not been applied to this prototype");
   }
   // "sync.unexpectedError" is ClientEvent.SyncUnexpectedError.
   (client as unknown as { on: (event: string, listener: () => void) => void }).on("sync.unexpectedError", () => {
     const crypto = client.getCrypto();
     if (crypto && Object.prototype.isPrototypeOf.call(proto, crypto)) {
-      stateOf(crypto).failed = true;
+      setFailedLatch(crypto, opts);
     }
   });
 }

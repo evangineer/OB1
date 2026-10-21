@@ -356,3 +356,180 @@ test("latchIncomingFailure: SyncUnexpectedError latches the client's crypto inst
   await other.onSyncCompleted({});
   assert.ok(calls.includes("save"), "the latch is per instance");
 });
+
+// ---- fix round 1: R12 (a failed incoming sync is never snapshotted) and R13 (a rejecting save is fatal) ----
+
+test("R12a: after poison(), save() never persists and saveUntilOk settles promptly without persisting", async () => {
+  let persists = 0;
+  const { log } = recordingLog();
+  const s = new SnapshotScheduler({
+    persist: async () => {
+      persists++;
+      return OK;
+    },
+    gate: openGate,
+    onFatal: () => {},
+    log,
+    sleep: async () => assert.fail("saveUntilOk must not back off and retry once poisoned"),
+  });
+  s.poison("incoming crypto processing failed");
+  const r = await s.save("after poison");
+  assert.equal(r.ok, false);
+  await assert.rejects(s.saveUntilOk("shutdown"), /incoming crypto processing failed/);
+  assert.equal(persists, 0);
+});
+
+test("R12a: a save queued behind an in-flight one does not persist once poisoned", async () => {
+  let persists = 0;
+  const release = deferred();
+  const s = new SnapshotScheduler({
+    persist: async () => {
+      persists++;
+      await release.promise;
+      return OK;
+    },
+    gate: openGate,
+    onFatal: () => {},
+    log: recordingLog().log,
+  });
+  const first = s.save("in flight");
+  await new Promise((r) => setImmediate(r));
+  const queued = s.save("queued");
+  s.poison("incoming crypto processing failed");
+  release.resolve();
+  await first;
+  assert.equal((await queued).ok, false);
+  assert.equal(persists, 1);
+});
+
+function poisonedWiring() {
+  let persists = 0;
+  const order: string[] = [];
+  const scheduler = new SnapshotScheduler({
+    persist: async () => {
+      persists++;
+      return OK;
+    },
+    gate: openGate,
+    onFatal: () => {},
+    log: recordingLog().log,
+  });
+  const Proc = fakeProcessor(order);
+  installPublishDurability(Proc.prototype, {
+    gate: openGate,
+    isPublishing: () => true,
+    beforePublish: async () => {
+      const r = await scheduler.save("before publish");
+      if (!r.ok) throw r.error;
+    },
+  });
+  return { scheduler, Proc, order, persists: () => persists };
+}
+
+test("R12b: a publish attempted after a preprocess failure latches neither persists nor sends", async () => {
+  const w = poisonedWiring();
+  const { Crypto } = fakeCryptoClass({ preprocessRejects: true });
+  installSyncDurability(Crypto.prototype, {
+    save: async () => assert.fail("no save"),
+    onIncomingFailure: () => {},
+    onLatched: (r) => w.scheduler.poison(r),
+  });
+  await assert.rejects(new Crypto().preprocessToDeviceMessages([{ type: "m.dummy" }]));
+  await assert.rejects(new w.Proc().makeOutgoingRequest("publish"));
+  assert.equal(w.persists(), 0);
+  assert.deepEqual(w.order, []);
+});
+
+test("R12b: a publish attempted after SyncUnexpectedError latches neither persists nor sends", async () => {
+  const w = poisonedWiring();
+  const { Crypto } = fakeCryptoClass();
+  const latched: string[] = [];
+  installSyncDurability(Crypto.prototype, {
+    save: async () => assert.fail("no save"),
+    onIncomingFailure: () => {},
+    onLatched: (r) => {
+      latched.push(r);
+      w.scheduler.poison(r);
+    },
+  });
+  const crypto = new Crypto();
+  const client = Object.assign(new EventEmitter(), { getCrypto: () => crypto });
+  latchIncomingFailure(client as never, Crypto.prototype);
+  client.emit("sync.unexpectedError", new Error("processing threw"));
+  assert.deepEqual(latched, ["incoming crypto processing failed"], "onLatched runs synchronously with the latch");
+  await assert.rejects(new w.Proc().makeOutgoingRequest("publish"));
+  assert.equal(w.persists(), 0);
+  assert.deepEqual(w.order, []);
+});
+
+test("R12c: onSyncCompleted does not invoke the original when already latched", async () => {
+  const { Crypto, calls } = fakeCryptoClass({ preprocessRejects: true });
+  const failures: string[] = [];
+  installSyncDurability(Crypto.prototype, {
+    save: async () => void calls.push("save"),
+    onIncomingFailure: (r) => failures.push(r),
+    onLatched: () => {},
+  });
+  const c = new Crypto();
+  await assert.rejects(c.preprocessToDeviceMessages([{ type: "m.dummy" }]));
+  calls.length = 0;
+  void c.onSyncCompleted({});
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(failures, ["incoming crypto processing failed"]);
+  assert.deepEqual(calls, [], "the original onSyncCompleted (which kicks outgoing requests) is not called");
+});
+
+test("R12c: a latch set while the original onSyncCompleted runs still prevents the save", async () => {
+  const calls: string[] = [];
+  const failures: string[] = [];
+  let latchNow: () => void = () => {};
+  class Crypto {
+    async preprocessToDeviceMessages(events: unknown[]): Promise<unknown[]> {
+      return events;
+    }
+    async onSyncCompleted(_s: unknown): Promise<void> {
+      calls.push("onSyncCompleted");
+      latchNow();
+    }
+  }
+  installSyncDurability(Crypto.prototype, {
+    save: async () => void calls.push("save"),
+    onIncomingFailure: (r) => failures.push(r),
+    onLatched: () => {},
+  });
+  const crypto = new Crypto();
+  const client = Object.assign(new EventEmitter(), { getCrypto: () => crypto });
+  latchIncomingFailure(client as never, Crypto.prototype);
+  latchNow = () => void client.emit("sync.unexpectedError", new Error("late"));
+  await crypto.preprocessToDeviceMessages([{ type: "m.dummy" }]);
+  let settled = false;
+  void crypto.onSyncCompleted({}).finally(() => (settled = true));
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(calls, ["onSyncCompleted"]);
+  assert.deepEqual(failures, ["incoming crypto processing failed"]);
+  assert.equal(settled, false);
+});
+
+test("R13: a rejecting save is fatal: logged at error, onIncomingFailure called, hook never settles", async () => {
+  const { Crypto } = fakeCryptoClass();
+  const failures: string[] = [];
+  const { log, lines } = recordingLog();
+  installSyncDurability(Crypto.prototype, {
+    save: async () => {
+      throw new Error("disk gone");
+    },
+    onIncomingFailure: (r) => failures.push(r),
+    log,
+  });
+  const c = new Crypto();
+  await c.preprocessToDeviceMessages([{ type: "m.dummy" }]);
+  let outcome = "pending";
+  c.onSyncCompleted({}).then(
+    () => (outcome = "resolved"),
+    () => (outcome = "rejected"),
+  );
+  for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+  assert.deepEqual(failures, ["snapshot save failed: disk gone"]);
+  assert.equal(outcome, "pending", "the sync loop must not continue (or silently die) after a failed save");
+  assert.ok(lines.some((l) => l.level === "error" && l.msg.includes("disk gone")));
+});

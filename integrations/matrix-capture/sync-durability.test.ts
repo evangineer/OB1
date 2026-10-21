@@ -29,9 +29,11 @@ function deferred<T = void>(): { promise: Promise<T>; resolve: (v: T) => void } 
 // The hooks are installed once per prototype (idempotent), so each test plugs in its own behaviour here.
 let currentSave: () => Promise<void> = async () => {};
 let currentOnIncomingFailure: (reason: string) => void = () => {};
+let currentOnLatched: (reason: string) => void = () => {};
 installSyncDurability(RustCrypto.prototype, {
   save: () => currentSave(),
   onIncomingFailure: (r) => currentOnIncomingFailure(r),
+  onLatched: (r) => currentOnLatched(r),
 });
 
 const toDeviceSync = {
@@ -111,6 +113,8 @@ test("failed incoming crypto processing: no save, onIncomingFailure, no second /
       saves++;
     };
     const failed = deferred<string>();
+    const latched: string[] = [];
+    currentOnLatched = (r) => latched.push(r);
     const bot = await startBot(hs);
     client = bot.client;
     currentOnIncomingFailure = (r) => {
@@ -123,6 +127,7 @@ test("failed incoming crypto processing: no save, onIncomingFailure, no second /
     await client.startClient();
 
     assert.equal(await failed.promise, "incoming crypto processing failed");
+    assert.ok(latched.length > 0, "onLatched (scheduler poison) ran before onSyncCompleted reported");
     await drain();
     assert.equal(saves, 0, "save is never entered after failed processing");
     assert.equal(bot.syncFetches(), 1, "no second /sync after the failure");
