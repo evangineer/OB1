@@ -2,310 +2,368 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** The capture bot refuses to run on crypto state that doesn't match its Matrix device, and never silently loses crypto state. It ships as a CI-built image pinned per tenant, and ob1m is rotated to a fresh device.
+**Goal:** The capture bot refuses to run on crypto state that doesn't match its Matrix device, and never silently loses crypto state. It ships as a CI-built image pinned per tenant by digest, and ob1m is rotated to a fresh device.
 
 **Architecture:**
-- `idb-persistence.ts` gains typed results, stale-lock recovery, a consistent single-transaction dump and atomic writes.
-- Two new pure modules hold the policy:
-  - `crypto-guard.ts`: the startup decision and the device-key check;
-  - `snapshot-scheduler.ts`: serialised saves, failure escalation, and the SDK hooks for durable-before-publish and save-before-next-sync.
+- `idb-persistence.ts` gains typed results, a restore that can't hang, a consistent single-transaction dump and atomic 0600 writes.
+- New modules:
+  - `snapshot-lease.ts`: a lifetime single-writer lease;
+  - `crypto-guard.ts`: the startup decision, the device-key check and the startup gate;
+  - `snapshot-scheduler.ts`: serialised saves, escalation, and the SDK hooks for durable-before-publish and save-before-next-sync, with a failure latch.
 - `service.ts` wires them in.
-- Rollout covers a GHCR workflow, a guarded `roles/ob1`, the ob1m stack pin, and operator-gated recovery.
+- Rollout covers a GHCR workflow, `roles/ob1` scoped per tenant with the on-node build guarded, the ob1m stack pinned by digest, and operator-gated recovery.
 
-**Tech Stack:** Node 20 (image) and TypeScript via tsx; matrix-js-sdk 36.2.0 with Rust crypto (`@matrix-org/matrix-sdk-crypto-wasm`, already installed); fake-indexeddb 6; `node:test`; GitHub Actions; Ansible; Docker Swarm through Dokploy.
+**Tech Stack:** Node 20 (image) and TypeScript via tsx; matrix-js-sdk 36.2.0 with Rust crypto (`@matrix-org/matrix-sdk-crypto-wasm`, already installed); fake-indexeddb 6; `node:test` and `node:http` for a fake homeserver; GitHub Actions; Ansible; Docker Swarm through Dokploy.
 
-**Spec:** `docs/superpowers/specs/2026-10-21-matrix-capture-crypto-store-design.md`. Section numbers (§, G1–G8) refer to it.
+**Spec:** `docs/superpowers/specs/2026-10-21-matrix-capture-crypto-store-design.md`. Section numbers (§, G1–G8) refer to it. "Codex #n" refers to the review findings folded into it.
 
 ## Global Constraints
 
 - Work in `~/src/OB1` on branch `matrix-capture-crypto-store`, which is cut from the deployed commit `5825a13`. Code lives in `integrations/matrix-capture/`.
-- No new npm dependencies. Tests use `node:test` via `node --import tsx --test`. Importing the already-installed `@matrix-org/matrix-sdk-crypto-wasm` is allowed.
-- The existing v8 snapshot format stays readable (`edf0b65`). The snapshot path default stays `/data/indexeddb/crypto-idb-snapshot.json`.
-- The stale-lock threshold is `60_000` ms. Saves escalate to `error` after 3 consecutive failures, and the process exits non-zero after 10 minutes (`600_000` ms) of continuous failure. The shutdown timeout is `20_000` ms, and the stack's `stop_grace_period` is `30s`.
-- Refusal messages begin `refusing to start: G1 …` or `refusing to start: G2 …`. G1 refusals end with `see RUNBOOK "Matrix device reauth"`.
-- Never log secrets, snapshot contents or private keys. The existing key-upload diagnostics stay behind `MATRIX_CRYPTO_DEBUG`.
-- Keep the third-party attribution headers. Commits are signed off (`-s`) and end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
-- The image is `ghcr.io/evangineer/ob1-matrix-capture` with immutable tags `0.2.0-<sha7>`, built for `linux/arm64` only, because `dokploy-main-12bl5` is aarch64.
-- Nothing touches ob1s: not its stack, its volume, or Sofia's device. Pushes, deploys, playbook applies and the rotation each need the operator's go-ahead.
+- No new npm dependencies. Tests use `node:test` via `node --import tsx --test`. Importing the already-installed `@matrix-org/matrix-sdk-crypto-wasm` and matrix-js-sdk internals is allowed.
+- The existing v8 snapshot format stays readable (`edf0b65`). The snapshot path default stays `/data/indexeddb/crypto-idb-snapshot.json`, and the lock is `<snapshot>.lock/owner.json`.
+- **Lease timings:** refresh every `10_000` ms; stale after `60_000` ms without a refresh, or when dated more than `60_000` ms in the future.
+- **Escalation and shutdown:** saves escalate to `error` after 3 consecutive failures, and the process exits non-zero after `600_000` ms of continuous failure. The shutdown timeout is `20_000` ms, and the stack's `stop_grace_period` is `30s`.
+- **Exact message prefixes:**
+  - `refusing to start: G1 device-key mismatch for <userId>/<deviceId>`, ending `see RUNBOOK "Matrix device reauth"`;
+  - `refusing to start: G1 could not verify device keys`;
+  - `refusing to start: G2 restore failed`;
+  - `refusing to start: G4 snapshot lease held by <hostname>/<pid>`;
+  - `G4 lease lost`;
+  - `incoming crypto processing failed`.
+- Snapshot and temp files are mode 0600 from creation. Never log secrets, snapshot contents or key values. The existing key-upload diagnostics stay behind `MATRIX_CRYPTO_DEBUG`.
+- Keep the third-party attribution headers. OB1 commits are signed off (`-s`), and all commits end with `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`.
+- **Image:** `ghcr.io/evangineer/ob1-matrix-capture`, `linux/arm64` only. CI derives the tag as `<version>-<sha7>` and refuses existing tags. Stacks pin `tag@sha256:digest`. The Dockerfile uses `npm ci` with `package-lock.json`.
+- Nothing touches ob1s: not its stack, its env file, its volume, or Sofia's device. `roles/ob1` acts only on `ob1_matrix_capture_managed_tenants: [ob1m]`. Pushes, deploys, applies and the rotation each need the operator's go-ahead.
 - `MATRIX_CRYPTO_DB_PREFIX` stays unwired, and is documented as inert.
 
 ## Review Focus
 
-1. **A legacy lock with no owner file.** The real 3 May locks have no `owner.json`. Expected: one older than 60 s is removed like any other stale lock. Test in Task 1.
-2. **A lock mtime in the future.** This can come from clock skew or a restored volume. Expected: an mtime more than 60 s ahead of now counts as stale, never "fresh forever". Test in Task 1.
-3. **A leftover temp file from a crashed write.** Expected: restore reads only the real snapshot path, and the next save replaces the temp file. Test in Task 2.
-4. **`/keys/query` unreachable or 5xx at startup.** Expected: G1 fails closed with `refusing to start: G1 could not verify device keys`, and the restart loop retries. Test in Task 4.
-5. **The snapshot directory is unwritable.** Expected: saves report failure, escalate, and eventually exit, and outgoing publishes stay blocked. Tests in Tasks 1 and 5.
+1. **The 3 May locks have no `owner.json`.** Expected: judged by the lock directory's mtime and taken over. Test in Task 3.
+2. **A lease dated in the future** (clock skew, restored volume). Expected: stale once more than 60 s ahead. Test in Task 3.
+3. **A leftover `.tmp` from a crashed write.** Expected: restore reads only the real path, and the next save replaces the temp file. Test in Task 2.
+4. **`/keys/query` unreachable or 5xx.** Expected: `refusing to start: G1 could not verify device keys`, with nothing published or saved. Tests in Tasks 4 and 7.
+5. **The snapshot directory is unwritable.** Expected: saves report failure, escalate and exit; publishes stay blocked. Tests in Tasks 1 and 5.
 
 ---
 
-### Task 1: Test harness, typed persistence results, stale-lock recovery
+### Task 1: Test harness, typed results, and a restore that can't hang
 
 **Files:**
-- Modify: `integrations/matrix-capture/idb-persistence.ts:30-57` (lock), `:242-288` (restore and persist)
-- Modify: `integrations/matrix-capture/package.json` (add `"test": "node --import tsx --test *.test.ts"`), `tsconfig.json` (`"include": ["*.ts"]`)
+- Modify: `integrations/matrix-capture/idb-persistence.ts`
+  - `restoreIndexedDatabases` `:185-240` and `restoreIdbFromDisk` `:242-264`: results, rejecting on `abort`/`error`/`blocked`, closing in `finally`;
+  - `persistIdbToDisk` `:266-288`: results.
+- Modify: `package.json`, adding `"test": "node --import tsx --test *.test.ts"`; `tsconfig.json`, setting `"include": ["*.ts", "test-fixtures/*.ts"]`
 - Create: `integrations/matrix-capture/idb-persistence.test.ts`
 
 **Interfaces:**
-- Produces, all exported from `idb-persistence.ts`:
+- Produces, exported from `idb-persistence.ts`:
   - `type RestoreResult = { status: "absent" } | { status: "restored"; databases: number } | { status: "failed"; error: unknown }`
   - `type PersistResult = { ok: true; databases: number } | { ok: false; error: unknown }`
-  - `type PersistenceOptions = { staleLockMs?: number; lockTimeoutMs?: number; log?: Pick<Console, "warn"> }`
-  - `const SNAPSHOT_LOCK_STALE_MS = 60_000`
+  - `type PersistenceOptions = { factory?: IDBFactory; log?: Pick<Console, "warn">; beforeRename?: () => void }`. `factory` defaults to fake-indexeddb's `indexedDB`; `beforeRename` is a test-only fault hook used in Task 2.
   - `restoreIdbFromDisk(snapshotPath: string, opts?: PersistenceOptions): Promise<RestoreResult>`
   - `persistIdbToDisk(params: { snapshotPath: string; databasePrefix?: string } & PersistenceOptions): Promise<PersistResult>`
-- Locks: the lock dir contains `owner.json` with `{ pid, hostname, acquiredAt }`. Callers within one process are serialised by a module-level promise-chain mutex before the filesystem lock is attempted.
+- Locking moves to Task 3. In this task, remove `withSnapshotLock` from both functions; Task 7 calls the lease instead.
 
-- [ ] **Step 1: Write failing tests** in `idb-persistence.test.ts`. Each test uses its own `fs.mkdtempSync` directory and a `log` spy.
-  - `removes a stale lock older than the threshold`: create `<snap>.lock/` with mtime now−120 s and no owner file. `persistIdbToDisk` returns `{ ok: true }`, the lock dir is gone afterwards, and a warn was logged that contains `stale` and the age.
-  - `treats a lock dated in the future as stale`: mtime now+120 s → `{ ok: true }`.
-  - `respects a fresh lock`: mtime now−1 s with `lockTimeoutMs: 300` → `{ ok: false }`, and the lock dir still exists.
-  - `reports failure instead of throwing when the directory is unwritable`: snapshot path under a regular file, so mkdir fails → `{ ok: false }`.
+- [ ] **Step 1: Write failing tests.** Each uses its own `mkdtempSync` directory and a `new IDBFactory()` passed as `factory`.
   - `restore distinguishes absent, restored and failed`:
-    - missing file → `{ status: "absent" }`;
-    - a file written by a successful persist after opening one fake-IDB database with one record → `{ status: "restored", databases: 1 }`;
-    - a file containing `garbage` → `{ status: "failed" }`.
+    - missing file → `absent`;
+    - a snapshot persisted from one database with one record → `{ status: "restored", databases: 1 }`;
+    - the bytes `garbage` → `failed`.
+  - `restore fails instead of hanging when insertion aborts`: build a v8 snapshot by hand, with a unique index and two records sharing that key. Within 2 s, `restoreIdbFromDisk` gives `failed`.
+  - `persist reports failure when the directory is unwritable`: the snapshot path sits under a regular file → `{ ok: false }`, with no throw.
 - [ ] **Step 2: Run them and watch them fail.**
   Run: `cd integrations/matrix-capture && npm test`
-  Expected: the failures are about stale locks, return shapes or timeouts, not about syntax.
-- [ ] **Step 3: Implement.**
-  - **Staleness:** compute `|now − mtime| > staleLockMs` from `fs.statSync(lockPath).mtimeMs`. Remove the lock with `fs.rmSync(lockPath, { recursive: true, force: true })`, warn once with the owner (when readable) and the age, then retry acquiring.
-  - **Results:** restore and persist return results instead of swallowing errors.
-- [ ] **Step 4: Run the tests and watch them pass**, then run `npm run typecheck`.
-  Expected: all Task 1 tests pass; typecheck exits 0.
-- [ ] **Step 5: Commit**: `git add integrations/matrix-capture/{idb-persistence.ts,idb-persistence.test.ts,package.json,tsconfig.json} && git commit -s -m "matrix-capture: typed snapshot results and stale-lock recovery"`
+  Expected: failures from the return shape, plus the abort test timing out.
+- [ ] **Step 3: Implement** the results, the abort/error/blocked rejection, `finally` closes, and the `factory` option.
+- [ ] **Step 4: Run them and watch them pass**, then run `npm run typecheck`.
+- [ ] **Step 5: Commit**: `git commit -s -m "matrix-capture: typed snapshot results; restore cannot hang"`
 
-### Task 2: Atomic writes and a consistent dump
+### Task 2: Atomic 0600 writes and a consistent dump
 
 **Files:**
-- Modify: `integrations/matrix-capture/idb-persistence.ts` (`dumpIndexedDatabases` `:137-182`, and the write in `persistIdbToDisk`)
-- Test: `integrations/matrix-capture/idb-persistence.test.ts`
+- Modify: `idb-persistence.ts`, the dump `:137-182` and the write
+- Test: `idb-persistence.test.ts`
 
 **Interfaces:**
-- Consumes: Task 1's `persistIdbToDisk` and `PersistenceOptions`.
-- Produces: `PersistenceOptions` gains `beforeRename?: () => void`, a test-only fault-injection hook. The temp file is named `<snapshotPath>.tmp`.
+- Consumes: Task 1's results and options.
+- The temp file is `<snapshotPath>.tmp`.
 
 - [ ] **Step 1: Write failing tests:**
-  - `a failure before rename leaves the old snapshot byte-identical`: persist once; read the bytes; add a record; persist with `beforeRename: () => { throw new Error("boom") }` → `{ ok: false }`, and the file bytes equal the earlier bytes.
-  - `restore ignores a leftover temp file`: write `garbage` to `<snap>.tmp` next to a valid snapshot → restore gives `{ status: "restored" }`. The next persist succeeds and leaves no `.tmp`.
-  - `a write spanning two stores is never torn`:
-    - open a database with stores `a` and `b`;
-    - start `persistIdbToDisk` without awaiting it, then immediately commit one `readwrite` transaction over `["a","b"]` putting `{k:1}` in each;
-    - await both, restore the snapshot into a fresh `IDBFactory`, and assert that `a` and `b` either both contain `k:1` or neither does.
-    - Repeat 20 times. Under the current per-store transactions this must fail at least once; if it doesn't, raise the record count until it does.
-- [ ] **Step 2: Run them and watch them fail.**
-  Run: `npm test`
-  Expected: the torn-dump and rename tests fail.
+  - `a failure before rename leaves the old snapshot byte-identical`: persist; read the bytes; add a record; persist with `beforeRename` throwing → `{ ok: false }`, and the bytes are unchanged.
+  - `snapshot and temp files are 0600 from creation`: make `beforeRename` assert `statSync(tmp).mode & 0o777 === 0o600`. After a successful persist the final file is also 0600.
+  - `restore ignores a leftover temp file` (Review Focus 3).
+  - `a two-store write is never torn` (Codex #5): the test must queue the write **deterministically between the two store reads**.
+    - Wrap the factory passed in so that, when the dump requests store `a`'s records, its `success` handler first starts a `readwrite` transaction over `["a","b"]` that puts `{k:1}` into each.
+    - Restore into a **fresh** `IDBFactory` via `factory`, and assert `a` and `b` agree.
+    - **Run this test against the unmodified dump first and record the failure.** If it passes against the old code, the test is wrong; fix it before going on.
+- [ ] **Step 2: Run them and watch them fail** (`npm test`).
 - [ ] **Step 3: Implement.**
   - **Dump:** one `db.transaction([...db.objectStoreNames], "readonly")` per database.
-  - **Write:** `writeFileSync(tmp)`, then `fsyncSync`, then `beforeRename?.()`, then `renameSync(tmp, snapshotPath)`, then fsync the directory (open it `"r"`, `fsyncSync`, close).
-- [ ] **Step 4: Run the tests and watch them pass.** Then run `npm run typecheck`.
-- [ ] **Step 5: Commit**: `git commit -s -m "matrix-capture: atomic snapshot writes and single-transaction dumps"`
+  - **Write:** `openSync(tmp, "w", 0o600)`, then write, `fsyncSync`, close, `beforeRename?.()`, `renameSync`, then fsync the directory.
+- [ ] **Step 4: Run them and watch them pass**, then run `npm run typecheck`.
+- [ ] **Step 5: Commit**: `git commit -s -m "matrix-capture: atomic 0600 snapshot writes; single-transaction dumps"`
 
-### Task 3: Prove the G5 assumption (one-time keys survive a snapshot round-trip)
-
-**Files:**
-- Create: `integrations/matrix-capture/test-fixtures/otk-roundtrip.ts`, a child-process script
-- Create: `integrations/matrix-capture/otk-roundtrip.test.ts`
-
-**Interfaces:**
-- Consumes: Tasks 1–2 `persistIdbToDisk` and `restoreIdbFromDisk`.
-- **The fixture:** `node --import tsx test-fixtures/otk-roundtrip.ts <generate|restore> <snapshotPath>`
-  - It imports `fake-indexeddb/auto`, runs `initAsync()` from `@matrix-org/matrix-sdk-crypto-wasm`, and calls `OlmMachine.initialize(new UserId("@t:example.org"), new DeviceId("TESTDEV"), "ob1-test")`.
-  - It takes the first `KeysUploadRequest` from `outgoingRequests()` and prints the sorted `one_time_keys` map as JSON on stdout.
-  - In `generate` mode it then persists. In `restore` mode it restores first.
-
-- [ ] **Step 1: Write the test** `one-time keys from a persisted snapshot match after restore`. It runs `generate`, then `restore` against the same temp path, and asserts the two stdout JSON objects are deep-equal and non-empty.
-- [ ] **Step 2: Run it.**
-  Run: `npm test`
-  - **Expected PASS.** This test checks an assumption rather than new code, so passing first time is the expected result. Record it in the ledger.
-  - **If it fails** (different keys after restore): **stop and bring it back.** The spec's G5 reasoning would be wrong, and the design must change before Task 5.
-- [ ] **Step 3: Commit**: `git commit -s -m "matrix-capture: prove one-time keys survive snapshot round-trip"`
-
-### Task 4: `crypto-guard.ts`: the startup decision and device-key check (G1, G2)
+### Task 3: `snapshot-lease.ts`, the lifetime single-writer lease (G4)
 
 **Files:**
-- Create: `integrations/matrix-capture/crypto-guard.ts`, `crypto-guard.test.ts`
+- Create: `integrations/matrix-capture/snapshot-lease.ts`, `snapshot-lease.test.ts`
 
 **Interfaces:**
-- Consumes: Task 1's `RestoreResult`.
 - Produces:
+  - `class SnapshotLease`
+    - `static acquire(params: { snapshotPath: string; now?: () => number; staleMs?: number; log?: Pick<Console, "warn">; hostname?: string; pid?: number }): SnapshotLease`
+      - Throws `Error` with the message `refusing to start: G4 snapshot lease held by <hostname>/<pid>` when a live lease exists.
+      - Takes over a stale lease with a warning that includes `stale`, the previous owner (or `unknown owner`) and the age in seconds.
+    - `refresh(): void`: updates `owner.json`'s mtime. It throws `G4 lease lost` if the token no longer matches.
+    - `assertHeld(): void`: throws `G4 lease lost` if `owner.json` is missing or holds another token.
+    - `startHeartbeat(intervalMs?: number /* 10_000 */): void` and `stopHeartbeat(): void`. A heartbeat failure calls the `onLost` callback given to `startHeartbeat(intervalMs, onLost)`.
+    - `release(): void`: removes the lock only if the token matches. It never throws.
+  - **Lock layout:** `<snapshotPath>.lock/owner.json` = `{ pid, hostname, token, acquiredAt }`, where `token` = `crypto.randomUUID()`. Staleness is judged by `owner.json`'s mtime, or by the lock dir's mtime when there is no owner file.
+
+- [ ] **Step 1: Write failing tests**, with injected `now` and `utimesSync`:
+  - `takes over an ownerless lock older than 60s` (Review Focus 1);
+  - `takes over a lock dated more than 60s in the future` (Review Focus 2);
+  - `refuses a live lease and leaves it intact`: a lease refreshed 5 s ago gives the exact refusal message, and `owner.json` is unchanged;
+  - `release never removes another owner's lease`: A acquires; the test overwrites `owner.json` with another token; `A.release()` leaves it there;
+  - `assertHeld throws after takeover`: A acquires; B takes over after A's file is backdated; `A.assertHeld()` throws `G4 lease lost`.
+- [ ] **Step 2: Run them and watch them fail** (`npm test`).
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run them and watch them pass**, then run `npm run typecheck`.
+- [ ] **Step 5: Commit**: `git commit -s -m "matrix-capture: lifetime single-writer snapshot lease"`
+
+### Task 4: One-time-key round-trip regression test, plus `crypto-guard.ts` (G1, G2, startup gate)
+
+**Files:**
+- Create: `test-fixtures/otk-roundtrip.ts`, `otk-roundtrip.test.ts`, `crypto-guard.ts`, `crypto-guard.test.ts`
+
+**Interfaces:**
+- **The fixture:** `node --import tsx test-fixtures/otk-roundtrip.ts <generate|restore> <snapshotPath>`.
+  - It runs `initAsync()`, then `OlmMachine.initialize(new UserId("@t:example.org"), new DeviceId("TESTDEV"), "ob1-test")` on fake-indexeddb.
+  - It prints the sorted `one_time_keys` of the first `KeysUploadRequest` as JSON.
+  - `generate` persists afterwards; `restore` restores first.
+- `crypto-guard.ts` produces:
   - `type Verdict = { ok: true; note?: string } | { ok: false; reason: string }`
   - `decideStartup(restore: RestoreResult): Verdict`
     - `restored` → ok;
     - `absent` → ok with `note: "no snapshot; starting with an empty crypto store"`;
-    - `failed` → `reason` starting `refusing to start: G2 restore failed:`.
-  - `checkDeviceIdentity(params: { userId: string; deviceId: string; local: { ed25519: string; curve25519: string }; server: Record<string, string> | undefined }): Verdict`
-    - `server` is the `keys` map for this device from `/keys/query`, or `undefined`.
-    - `undefined` → ok with `note` containing `new device`.
-    - Both `ed25519:<deviceId>` and `curve25519:<deviceId>` equal → ok.
-    - Otherwise → `reason` starting `refusing to start: G1 device-key mismatch for <userId>/<deviceId>` and ending `see RUNBOOK "Matrix device reauth"`.
-  - `fetchServerDeviceKeys(params: { homeserverUrl: string; accessToken: string; userId: string; deviceId: string; fetchImpl?: typeof fetch }): Promise<Record<string, string> | undefined>`
-    - Sends `POST /_matrix/client/v3/keys/query` with body `{ device_keys: { [userId]: [deviceId] } }` and returns `device_keys[userId][deviceId]?.keys`.
-    - Throws `Error("refusing to start: G1 could not verify device keys: <status>")` on a non-2xx response or a network error.
+    - `failed` → `refusing to start: G2 restore failed: <message>`.
+  - `checkDeviceIdentity(p: { userId; deviceId; local: { ed25519: string; curve25519: string }; server: Record<string,string> | undefined }): Verdict`
+    - `undefined` → ok with a note containing `new device`;
+    - both keys equal → ok;
+    - else → the G1 mismatch message, which contains no key values.
+  - `fetchServerDeviceKeys(p: { homeserverUrl; accessToken; userId; deviceId; fetchImpl?: typeof fetch }): Promise<Record<string,string> | undefined>`
+    - Sends a raw `POST /_matrix/client/v3/keys/query` with `{ device_keys: { [userId]: [deviceId] } }`.
+    - Throws `refusing to start: G1 could not verify device keys: <status|error>`.
+  - `class StartupGate`: `wait(): Promise<void>`, which resolves only after `open()`; `open(): void`; and `get isOpen(): boolean`.
 
-- [ ] **Step 1: Write failing tests**, one per verdict branch above:
-  - restored, absent and failed;
-  - match, server undefined, ed25519 mismatch and curve25519 mismatch;
-  - `fetchServerDeviceKeys` with a fake `fetchImpl` returning 200 and keys, 200 without the device, 502, and a rejected promise.
-  - The mismatch test asserts the exact prefix and suffix from the Global Constraints. It also asserts that neither key value appears in `reason`.
-- [ ] **Step 2: Run them and watch them fail** (`npm test`; the module is missing).
-- [ ] **Step 3: Implement** the three functions.
-- [ ] **Step 4: Run the tests and watch them pass.** Then run `npm run typecheck`.
-- [ ] **Step 5: Commit**: `git commit -s -m "matrix-capture: startup decision and device-key identity check"`
+- [ ] **Step 1: Write the tests:**
+  - **The round-trip:** `generate` and `restore` print deep-equal, non-empty key sets.
+    - Codex already observed this with the real WASM library, so it is a **regression guard**, and passing first time is expected.
+    - If it ever fails, stop: the G5 reasoning is broken.
+  - **Guard tests:** one per verdict branch; `fetchServerDeviceKeys` against 200 with keys, 200 without the device, 502 and a network rejection (Review Focus 4); `StartupGate.wait()` stays pending until `open()`.
+- [ ] **Step 2: Run them.** The guard tests fail because the module is missing; the round-trip test passes. Record both.
+- [ ] **Step 3: Implement** `crypto-guard.ts`.
+- [ ] **Step 4: Run them and watch them pass**, then run `npm run typecheck`.
+- [ ] **Step 5: Commit**: `git commit -s -m "matrix-capture: startup decision, device-key check, startup gate"`
 
-### Task 5: `snapshot-scheduler.ts`: serialised saves, escalation, SDK durability hooks (G5, G6)
+### Task 5: `snapshot-scheduler.ts`: saves, escalation, and the SDK durability hooks (G5, G6)
 
 **Files:**
-- Create: `integrations/matrix-capture/snapshot-scheduler.ts`, `snapshot-scheduler.test.ts`
+- Create: `snapshot-scheduler.ts`, `snapshot-scheduler.test.ts`, `sync-durability.test.ts`, `test-fixtures/fake-homeserver.ts`
 
 **Interfaces:**
-- Consumes: Task 1's `PersistResult`.
+- Consumes: `PersistResult` (Task 1), `SnapshotLease` (Task 3), `StartupGate` (Task 4).
 - Produces:
-  - `class SnapshotScheduler`, constructed with `{ persist: () => Promise<PersistResult>; now?: () => number; log?: Pick<Console, "log" | "warn" | "error">; onFatal: (reason: string) => void; errorAfter?: number /* 3 */; fatalAfterMs?: number /* 600_000 */ }`
+  - `class SnapshotScheduler`, constructed with `{ persist: () => Promise<PersistResult>; lease: Pick<SnapshotLease, "assertHeld">; gate: Pick<StartupGate, "wait">; onFatal: (reason: string) => void; now?: () => number; log?: Pick<Console,"log"|"warn"|"error">; errorAfter?: number; fatalAfterMs?: number }`
     - `save(reason: string): Promise<PersistResult>`
-      - **Serialised:** a call made while a save is running waits for it, then runs its own save.
-      - **Coalesced:** calls made while one save is *queued* share that queued save.
-      - Logs `Persisted Matrix IndexedDB snapshot (<reason>)` only on `ok`.
-      - On failure: `warn` while consecutive failures are under 3, `error` from the 3rd. `onFatal("snapshot saves failing for <n>s")` fires once the first failure in the current streak is ≥ `fatalAfterMs` old. A success resets the streak.
-    - `saveUntilOk(reason: string, backoffMs?: [number, number] /* [1000, 30000] */): Promise<void>` retries with doubling backoff until ok. Escalation and `onFatal` still apply.
-  - `installPublishDurability(proto: { makeOutgoingRequest(msg: unknown, uia?: unknown): Promise<void> }, opts: { isPublishing: (msg: unknown) => boolean; beforePublish: () => Promise<void> }): void`
-    - Idempotent (flag `__ob1DurablePatched`).
-    - For publishing messages it awaits `beforePublish()` before calling the original. If that throws, the original is never called and the error propagates.
-  - `installSyncDurability(proto: { preprocessToDeviceMessages(events: unknown[]): Promise<unknown>; onSyncCompleted(state: unknown): Promise<void> }, save: () => Promise<void>): void`
+      - First awaits `gate.wait()`, then calls `lease.assertHeld()` (a throw means `onFatal("G4 lease lost")` and the call returns `{ok:false}`).
+      - **Serialised:** a call made while a save is running waits for it, then runs its own.
+      - **Coalesced:** calls made while a save is queued share it.
+      - `Persisted Matrix IndexedDB snapshot (<reason>)` is logged only on ok.
+      - Failures: `warn`, then `error` from the 3rd; `onFatal("snapshot saves failing for <n>s")` once the streak is ≥ 600 s.
+    - `saveUntilOk(reason: string): Promise<void>`: backoff doubling from 1 s up to 30 s; escalation still applies.
+  - `installPublishDurability(proto, opts: { gate: Pick<StartupGate,"wait">; isPublishing: (msg: unknown) => boolean; beforePublish: () => Promise<void> }): void`
+    - Idempotent (`__ob1DurablePatched`).
+    - **Every** request first awaits `gate.wait()`. Publishing requests then await `beforePublish()`, which throws when the save isn't ok, before the original is called.
+  - `installSyncDurability(proto, opts: { save: () => Promise<void>; onIncomingFailure: (reason: string) => never | void }): void`
     - Idempotent.
-    - A non-empty `events` passed to `preprocessToDeviceMessages` marks the instance dirty.
-    - `onSyncCompleted` awaits the original, then, if dirty, awaits `save()` and clears the flag.
-  - `isPublishingRequest(msg: unknown): boolean`: `instanceof` against `KeysUploadRequest`, `SignatureUploadRequest`, `UploadSigningKeysRequest`, `ToDeviceRequest`, `KeysBackupRequest` and `PutDehydratedDeviceRequest` from `@matrix-org/matrix-sdk-crypto-wasm`.
+    - Wraps `preprocessToDeviceMessages`: non-empty `events` mark the instance dirty, and a rejection latches `failed`.
+    - Wraps `onSyncCompleted`: awaits the original. If `failed` is latched, it calls `onIncomingFailure("incoming crypto processing failed")` and does **not** save. Else, if dirty, it awaits `save()` and clears the flag.
+    - `latchIncomingFailure(client)` subscribes to `ClientEvent.SyncUnexpectedError` and sets the same latch.
+  - `isPublishingRequest(msg: unknown): boolean`: `instanceof` against `KeysUploadRequest`, `SignatureUploadRequest`, `UploadSigningKeysRequest`, `ToDeviceRequest`, `KeysBackupRequest` and `PutDehydratedDeviceRequest`.
+  - `test-fixtures/fake-homeserver.ts`: `startFakeHomeserver(handlers): Promise<{ url: string; requests: { method: string; path: string }[]; close(): Promise<void> }>`, built on `node:http`. It serves `/versions`, `/sync` (queued responses), `/keys/query`, `/keys/upload`, `/room_keys/version` and a catch-all `{}`.
 
 - [ ] **Step 1: Write failing tests:**
-  - **Serialised:** a persist that resolves only after a deferred releases it. Call `save` twice. The second persist starts only after the first resolves.
-  - **Coalesced:** three calls during one in-flight save give 2 persists in total.
-  - **Escalation:** a fake clock and a persist that always fails. Calls 1–2 warn and call 3 errors. `onFatal` is not called at t=599 s and is called once at t=600 s. A success then resets the streak.
-  - **Publish ordering:** a fake proto whose original records `"send"`, and a `beforePublish` that records `"save"` after a tick. Order is `["save","send"]`. With `isPublishing` false there is no save. A throwing `beforePublish` means no `"send"` and a rejected call.
-  - **Sync ordering:** with to-device events, the order is `["original","save"]`, and `onSyncCompleted`'s promise resolves only after the save. With an empty events array there is no save.
-  - **Unwritable directory (Review Focus 5):** `saveUntilOk` with an always-failing persist and fake timers keeps retrying, and calls `onFatal` at 600 s.
+  - **`snapshot-scheduler.test.ts`:**
+    - **Serialised and coalesced saves:** a gated persist; 3 calls during one in-flight save give 2 persists.
+    - **The gate blocks saves:** no persist until `open()`.
+    - **Lease lost:** `assertHeld` throws → `onFatal("G4 lease lost")` and no persist.
+    - **Escalation:** with a fake clock, warn, warn, then error; no `onFatal` at 599 s and one at 600 s; a success resets the streak.
+    - **Publish ordering:** the order is `["gate","save","send"]`; a non-publishing request records `["gate","send"]`; a throwing `beforePublish` means no `"send"` and a rejected call.
+    - **The real classifier (Codex #6):** after `initAsync()`, an `OlmMachine` in memory yields a `KeysUploadRequest` from `outgoingRequests()`, and `isPublishingRequest` is true. A `KeysQueryRequest` from `OlmMachine.updateTrackedUsers` plus `outgoingRequests()` is false.
+  - **`sync-durability.test.ts`, against the real `SyncApi` (Codex #6, #1):**
+    - **Setup:** `createClient` points at the fake homeserver, then `initRustCrypto({ useIndexedDB: false })`, then `installSyncDurability(RustCrypto.prototype, …)`, then `startClient()`.
+    - **Barrier:** queue `/sync` #1 carrying a `to_device` event of type `m.dummy`, and give `save` a pending deferred. After 500 ms, the fake has seen exactly one `/sync`. Resolve the deferred, and a second `/sync` arrives.
+    - **Failure latch:** patch `RustCrypto.prototype.receiveSyncChanges` to reject. `onIncomingFailure` is called with `incoming crypto processing failed`, `save` is never called, and after 500 ms only one `/sync` has been seen. `onIncomingFailure` in the test records the call and stops the client, so it doesn't exit.
 - [ ] **Step 2: Run them and watch them fail** (`npm test`).
-- [ ] **Step 3: Implement.** No test covers `isPublishingRequest`'s wasm `instanceof` checks directly; Task 6's typecheck and the live check (Task 9) cover them.
-- [ ] **Step 4: Run the tests and watch them pass.** Then run `npm run typecheck`.
-- [ ] **Step 5: Commit**: `git commit -s -m "matrix-capture: serialised snapshot saves and durability hooks"`
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run them and watch them pass**, then run `npm run typecheck`.
+- [ ] **Step 5: Commit**: `git commit -s -m "matrix-capture: gated, serialised saves and sync/publish durability hooks"`
 
-### Task 6: Wire it into `service.ts`; shutdown, logging, Dockerfile, README (G1–G7)
+### Task 6: Shutdown helper
 
 **Files:**
-- Modify: `integrations/matrix-capture/service.ts`. That means `:133-176` (persist, schedule and restore), `:178-189` (`loadMatrixSdk`), `:622-720` (`main`), `:691-697` (failed decryption) and `:803-814` (shutdown).
-- Modify: `decrypt-bridge.ts:236` ("Giving up…" becomes `console.warn`), `Dockerfile`, `README.md`
-- Create: `integrations/matrix-capture/shutdown.ts`, `service.test.ts`
+- Create: `shutdown.ts`, `shutdown.test.ts`
 
 **Interfaces:**
-- Consumes: Tasks 1, 4 and 5.
-- Produces: `runShutdown(steps: () => Promise<void>, timeoutMs: number): Promise<"done" | "timeout">`, exported from `shutdown.ts`.
+- Produces: `runShutdown(steps: () => Promise<PersistResult | void>, timeoutMs: number): Promise<{ outcome: "done" | "timeout" | "save-failed"; exitCode: 0 | 1 }>`. `"save-failed"` applies when the steps resolve with `{ ok: false }` (Codex #9).
 
-**Wiring (in this order inside `main`):**
-1. `loadMatrixSdk` stores the `RestoreResult`. `decideStartup` runs on it; a failure throws its `reason`.
-2. `installPublishDurability` and `installSyncDurability` are installed **unconditionally** when `MATRIX_USE_INDEXEDDB`. They target `OutgoingRequestProcessor.prototype` and `RustCrypto.prototype`, using `isPublishingRequest`, `() => scheduler.save("publish")` that throws when not ok, and `() => scheduler.saveUntilOk("sync")`. They go in before `initRustCrypto`.
-3. `initRustCrypto`, then `checkDeviceIdentity(crypto.getOwnDeviceKeys(), await fetchServerDeviceKeys(...))`. A failure throws its `reason`.
-4. Only then: the "post-init" save via `scheduler`, then the 60 s interval via `scheduler.save("interval")`.
-5. Then `bootstrapCrossSigning` and the rest, unchanged.
+- [ ] **Step 1: Write failing tests**, one per outcome, with fake timers: done → 0; never-resolving → timeout → 1; `{ok:false}` → save-failed → 1.
+- [ ] **Step 2: Run them and watch them fail.**
+- [ ] **Step 3: Implement.**
+- [ ] **Step 4: Run them and watch them pass.**
+- [ ] **Step 5: Commit**: `git commit -s -m "matrix-capture: bounded shutdown that reports save failure"`
+
+### Task 7: Wire it into `service.ts`; logging, Dockerfile, README (G1–G7)
+
+**Files:**
+- Modify: `service.ts`. That means `:133-189` (persist, schedule, restore and `loadMatrixSdk`), `:622-720` (`main`), `:691-697` (failed decryption) and `:803-814` (shutdown).
+- Modify: `decrypt-bridge.ts:236` ("Giving up…" becomes `console.warn`), `Dockerfile`, `.dockerignore` (new; excludes `*.test.ts`, `test-fixtures/` and `node_modules`), `README.md`
+- Create: `service.test.ts`
+
+**Interfaces:**
+- Consumes: everything from Tasks 1–6.
+
+**Wiring order in `main()` when `MATRIX_USE_INDEXEDDB`:**
+1. `SnapshotLease.acquire`. A throw reaches `main().catch`, which prints the message and exits 1.
+2. `restoreIdbFromDisk`, then `decideStartup`; refuse on failure.
+3. Create the gate and scheduler. Install `installPublishDurability(OutgoingRequestProcessor.prototype, { gate, isPublishing: isPublishingRequest, beforePublish })` **and** `installSyncDurability(RustCrypto.prototype, { save: () => scheduler.saveUntilOk("sync"), onIncomingFailure })`. `onIncomingFailure` logs and exits 1.
+4. `createClient`, then `latchIncomingFailure(client)`, then `initRustCrypto`.
+5. `checkDeviceIdentity(crypto.getOwnDeviceKeys(), await fetchServerDeviceKeys(...))`. If it refuses: throw, with the gate still closed.
+6. `gate.open()`, `lease.startHeartbeat(10_000, onLost)`, the `scheduler.save("post-init")` save, and the 60 s interval via `scheduler.save("interval")`.
+7. `bootstrapCrossSigning` and the rest, unchanged.
 
 **Other changes:**
-- **Exit codes:** `onFatal` logs the reason and calls `process.exit(1)`. The existing `main().catch` already exits 1, so the first error line it prints is the `reason`.
-- **Failed decryptions:** `emitFailedDecryption` always logs `console.warn("Matrix decryption failed", { eventId, roomId, sender })`, and nothing else from the event.
-- **Shutdown:** wrap the existing shutdown body in `runShutdown(…, 20_000)`, then exit 0 for `"done"` or 1 for `"timeout"`. Guard it against running twice.
-- **Dockerfile:** `CMD ["node", "--import", "tsx", "service.ts"]`, and `COPY *.ts ./` (excluding `*.test.ts` via `.dockerignore`).
+- **Failed decryptions:** `emitFailedDecryption` logs `console.warn("Matrix decryption failed", { eventId, roomId, sender })`.
+- **Shutdown:** `runShutdown` with the existing steps plus the final save, then `lease.release()`, then `process.exit(exitCode)`. Guard it against running twice.
+- **Dockerfile:**
+  - `COPY package.json package-lock.json ./` and `RUN npm ci`;
+  - `COPY *.ts ./`;
+  - `CMD ["node", "--import", "tsx", "service.ts"]`.
 - **README:**
   - correct the atomic-write claim (:260, :283) and the snapshot filename (`.json`);
   - mark `MATRIX_CRYPTO_DB_PREFIX` as inert;
-  - add a "Failure modes" section listing the G1, G2 and save-failure messages.
+  - add "Failure modes", listing every refusal and fatal message.
 
-- [ ] **Step 1: Write failing tests:**
-  - `shutdown.ts`: `runShutdown` returns `"done"` for fast steps and `"timeout"` at the deadline for a never-resolving step, with fake timers.
-  - `service.test.ts`, which spawns `node --import tsx service.ts` with:
-    - `MATRIX_USE_INDEXEDDB=true`;
-    - `MATRIX_INDEXEDDB_PATH` set to a temp dir containing a `garbage` snapshot;
-    - the other required env set to dummies.
-  - Assert: exit code 1; the first stderr line matching `/refusing to start/` starts `refusing to start: G2 restore failed`; the snapshot bytes are unchanged; no `.tmp` file is left.
-- [ ] **Step 2: Run them and watch them fail** (`npm test`). Today the service ignores a failed restore, so it fails differently (on the dummy homeserver).
+- [ ] **Step 1: Write failing tests** in `service.test.ts`. Each spawns `node --import tsx service.ts` with `MATRIX_USE_INDEXEDDB=true`, `MATRIX_INDEXEDDB_PATH=<tmp>`, dummy Supabase and OpenRouter env, and `MATRIX_HOMESERVER_URL` pointing at the fake homeserver.
+  - **`refuses on a corrupt snapshot (G2)`:** exit 1; the first `refusing to start` line starts `refusing to start: G2 restore failed`; the snapshot bytes are unchanged; no `.tmp` is left.
+  - **`refuses on a live lease (G4)`:** acquire a lease in the test process first; the service exits 1 with the G4 message.
+  - **`refuses on a device-key mismatch without publishing or saving (G1, gate)`:**
+    - Empty store; the fake's `/keys/query` returns different keys for the device; it also answers `GET /room_keys/version` with a backup version.
+    - Expected: exit 1 with the G1 mismatch line. The fake recorded **no** `POST /keys/upload`, `/keys/signatures/upload`, `/keys/device_signing/upload`, `PUT /room_keys/keys` or `PUT /sendToDevice`. No snapshot file exists.
+  - **`refuses when /keys/query fails (Review Focus 4)`:** the fake returns 502 → exit 1 with `G1 could not verify device keys`, and nothing published.
+- [ ] **Step 2: Run them and watch them fail** (`npm test`). Today's service ignores all of this.
 - [ ] **Step 3: Implement the wiring** above.
 - [ ] **Step 4: Run all tests and typecheck.**
   Run: `npm test && npm run typecheck`
   Expected: all green.
-- [ ] **Step 5: Check the image builds locally.**
+- [ ] **Step 5: Check the image builds.**
   Run: `docker build -t ob1-matrix-capture:test integrations/matrix-capture`
-  Expected: success. If the dev machine can't build arm64, an amd64 build is enough here.
+  Expected: success. An amd64 build is acceptable locally.
 - [ ] **Step 6: Commit**: `git commit -s -m "matrix-capture: fail closed on mismatched crypto state; durable saves wired in"`
 
-### Task 7: CI image workflow (G8)
+### Task 8: CI image workflow (G8)
 
 **Files:**
 - Create: `.github/workflows/matrix-capture-image.yml`
 
 **Interfaces:**
-- Produces: the image `ghcr.io/evangineer/ob1-matrix-capture:<tag>`, consumed by Task 9's stack pin.
+- Produces: `ghcr.io/evangineer/ob1-matrix-capture:<version>-<sha7>`. The job summary prints the tag and digest, which Task 10 consumes.
 
-- [ ] **Step 1: Write the workflow.** Model it on `~/src/operately/.github/workflows/bpcs-image.yml`, simplified to a single job:
-  - `on: workflow_dispatch` with a required `tag` input;
+- [ ] **Step 1: Write the workflow:**
+  - `workflow_dispatch` with a `version` input, checked against `^[0-9]+\.[0-9]+\.[0-9]+$`;
   - `permissions: { contents: read, packages: write }`;
-  - `runs-on: ubuntu-24.04-arm`;
-  - checkout, `docker/setup-buildx-action@v3`, then `docker/login-action@v3` (ghcr.io, `github.actor`, `GITHUB_TOKEN`);
-  - `docker/build-push-action@v6` with `context: integrations/matrix-capture`, `platforms: linux/arm64`, `push: true`, `tags: ghcr.io/evangineer/ob1-matrix-capture:${{ inputs.tag }}`;
-  - before building, a step that runs `npm ci && npm test` in the context directory.
-  - Add a guard step that fails if the tag doesn't match `^[0-9]+\.[0-9]+\.[0-9]+-[0-9a-f]{7}$`.
+  - `runs-on: ubuntu-24.04-arm`.
+  - **Steps:**
+    1. checkout;
+    2. derive `TAG=<version>-$(git rev-parse --short=7 HEAD)`;
+    3. log in to GHCR;
+    4. **fail if `docker manifest inspect ghcr.io/evangineer/ob1-matrix-capture:$TAG` succeeds**, because the tag already exists;
+    5. `npm ci && npm test` in `integrations/matrix-capture`;
+    6. `docker/build-push-action@v6` with `platforms: linux/arm64` and `push: true`;
+    7. write the tag and `steps.build.outputs.digest` to `$GITHUB_STEP_SUMMARY`.
 - [ ] **Step 2: Validate.**
-  Run: `python3 -c "import yaml,sys; yaml.safe_load(open('.github/workflows/matrix-capture-image.yml'))"`, plus `actionlint` if it's installed.
+  Run: `python3 -c "import yaml; yaml.safe_load(open('.github/workflows/matrix-capture-image.yml'))"`, plus `actionlint` if it's installed.
   Expected: no errors.
-- [ ] **Step 3: Commit**: `git commit -s -m "matrix-capture: CI image build to GHCR"`
+- [ ] **Step 3: Commit**: `git commit -s -m "matrix-capture: CI image build to GHCR with derived immutable tags"`
 
-### Task 8: Guard the on-node build; add a backup to reauth; RUNBOOK (dokploy-playbooks)
+### Task 9: Per-tenant `roles/ob1`, guarded on-node build, reauth backup, RUNBOOK (dokploy-playbooks)
 
 **Files** (in `~/src/dokploy-playbooks`, new branch `ob1-crypto-store` from `main`):
-- Modify: `roles/ob1/tasks/main.yml`. Add `when: ob1_matrix_capture_build_on_node | bool` to the tasks from "Inspect currently deployed matrix-capture source commit" (`:40`) through "Build matrix-capture image" (`:95`), and to "Force-update OB1 matrix-capture services" (`:371`).
-- Modify: `group_vars/all/vars.yml`. Add `ob1_matrix_capture_build_on_node: false` with a comment pointing to the spec.
-- Modify: `reauth-ob1-matrix.yml:108`. Before "Clear crypto store from volume", add "Back up crypto store before wipe": `docker run --rm -v {{ crypto_volume }}:/data:ro -v /var/backups/ob1:/backup alpine tar czf /backup/{{ tenant }}-crypto-<ts>.tgz -C /data indexeddb`, then `chmod 600` the file. `/var/backups/ob1` is created 0700 root.
+- Modify: `group_vars/all/vars.yml`. Add `ob1_matrix_capture_managed_tenants: [ob1m]` and `ob1_matrix_capture_build_on_node: false`, with comments pointing at the spec.
+- Modify: `roles/ob1/tasks/main.yml`:
+  - **`ob1_matrix_capture_deployments`** (`:28-38`): filter it to managed tenants. Every task looping over it inherits the filter: the env files (`:207`), change detection (`:268`), webhooks (`:290-344`) and rollover checks (`:345`).
+  - **Change detection** becomes per tenant: one flag per tenant, from the per-item results of the env-file task.
+  - **Force-update** (`:371`) loops only over managed tenants' services.
+  - **On-node build tasks** (`:40-102`) and force-update get `when: ob1_matrix_capture_build_on_node | bool`.
+- Modify: `reauth-ob1-matrix.yml`:
+  - before "Clear crypto store" (`:108`), back up the volume read-only into `/var/backups/ob1/` (directory 0700, file 0600);
+  - assert at the top that `tenant in ob1_matrix_capture_managed_tenants`.
 - Modify: `RUNBOOK.md`:
-  - an incident note (3 May stale lock, discovered 2026-10-21);
-  - a "Capture bot refuses to start (G1/G2)" entry with its fixes;
-  - "Matrix device reauth" mentions the backup;
-  - a note not to change the ob1 env file until ob1s is off `:current` (an env change triggers both webhooks, `:268-321`);
-  - the device record at `:2550`, updated in Task 9 after the rotation.
+  - an incident note (3 May stale lock, found 2026-10-21);
+  - "Capture bot refuses to start", listing each message and its fix;
+  - the reauth section's backup step and the managed-tenants rule;
+  - a pointer to the spec.
 
 - [ ] **Step 1: Make the edits.**
 - [ ] **Step 2: Verify.**
   Run: `ansible-playbook site.yml --syntax-check && ansible-playbook reauth-ob1-matrix.yml --syntax-check`
   Expected: no errors.
-  **[OPERATOR]** Then run `ansible-playbook site.yml --tags ob1 --check --diff`. Expected: the guarded tasks are skipped, and no force-update or webhook task is changed.
-- [ ] **Step 3: Commit**: `git commit -m "Guard on-node OB1 capture build; back up crypto store before reauth wipe"`, with the attribution line, referencing the spec path.
+  **[OPERATOR]** `ansible-playbook site.yml --tags ob1 --check --diff`. Expected:
+  - no task references ob1s's env file, service or webhook;
+  - the build tasks are skipped;
+  - nothing else changes.
+  **[OPERATOR]** `ansible-playbook reauth-ob1-matrix.yml -e tenant=ob1s --check`. Expected: it fails at the managed-tenants assert.
+- [ ] **Step 3: Commit**: `git commit -m "Scope OB1 capture role per tenant; guard on-node build; back up before reauth"`, with the attribution line.
 
-### Task 9: [OPERATOR-GATED] Roll out to ob1m and rotate its device (§7.1–7.4)
+### Task 10: [OPERATOR-GATED] Roll out to ob1m and rotate its device (§7.1–7.4)
 
 Every bullet that changes production needs the operator's go-ahead first.
 
-- [ ] **Step 1: Back up ob1m's volume.** As root on `dokploy-main-12bl5`, tar `ob1-ob1m-1hzbi8_matrix_capture_data` read-only to `/var/backups/ob1/ob1m-crypto-pre-fix-<ts>.tgz` with mode 0600.
-  Expected: the archive lists `indexeddb/crypto-idb-snapshot.json` dated 2026-05-03.
-- [ ] **Step 2: Publish the image.**
+- [ ] **Step 1: Back up ob1m's volume.** Tar it read-only to `/var/backups/ob1/ob1m-crypto-pre-fix-<ts>.tgz` (mode 0600).
+  Expected: the archive lists the snapshot dated 2026-05-03.
+- [ ] **Step 2: Merge and apply Task 9** (dokploy-playbooks).
+  Expected: the role run changes nothing for ob1s, and ob1s's task ID is unchanged.
+- [ ] **Step 3: Publish the image.**
   - Push the OB1 branch.
-  - Dispatch `matrix-capture-image` with `tag=0.2.0-<sha7>` of HEAD.
-  - Make the package **public** in GitHub's package settings.
-  Expected: `docker manifest inspect ghcr.io/evangineer/ob1-matrix-capture:0.2.0-<sha7>` shows `arm64`.
-- [ ] **Step 3: Pin ob1m's stack.** In `~/src/dokploy-stacks/ob1-ob1m/docker-compose.yml`:
-  - `image: ghcr.io/evangineer/ob1-matrix-capture:0.2.0-<sha7>`;
+  - Dispatch the workflow with `version=0.2.0`.
+  - Make the package public.
+  Expected: the summary shows the tag and an arm64 digest.
+- [ ] **Step 4: Pin ob1m's stack.** In `~/src/dokploy-stacks/ob1-ob1m/docker-compose.yml`:
+  - `image: ghcr.io/evangineer/ob1-matrix-capture:<tag>@sha256:<digest>`;
   - `stop_grace_period: 30s`;
   - `init: true`.
-  Commit it. Pushing to `main` redeploys via Dokploy (watchPaths), so the push needs the operator's OK.
-  Expected: the ob1m task fails and keeps failing; its first refusal line is `refusing to start: G1 device-key mismatch for @evangineer…/OB1M05`; the logs show the stale-lock warning and a successful restore. ob1s is unaffected: same task ID, same image.
-- [ ] **Step 4: Preflight the login.** Log in with the vaulted ob1m password, then log that test session out immediately.
-  Expected: 200, then 200. If it fails, stop.
-- [ ] **Step 5: Rotate the device** with `ansible-playbook reauth-ob1-matrix.yml -e tenant=ob1m`.
+  Commit it. Pushing to `main` redeploys through Dokploy.
+  - **Expected:**
+    - the logs show the stale-lease takeover warning and a successful restore;
+    - then `refusing to start: G1 device-key mismatch for @evangineer…/OB1M05`;
+    - no publishing requests from OB1M05 in the Synapse log since the deploy;
+    - ob1s unchanged.
+- [ ] **Step 5: Preflight the login.** Log in with the vaulted ob1m password, then log that test session out at once.
+  Expected: 200, then 200. If not, stop.
+- [ ] **Step 6: Rotate.** Run `ansible-playbook reauth-ob1-matrix.yml -e tenant=ob1m`.
   - Verify the new device (RUNBOOK :1064-1112).
   - Sign out `OB1M05`.
+  - Update the vault token, then re-run `--tags ob1`. Expected: only ob1m redeploys.
   - Update the RUNBOOK device record (:2550) and commit it.
-- [ ] **Step 6: Validate (§7.4).**
-  - Two `docker service update --force` restarts of ob1m only give no `already exists` lines for the new device in Synapse's log.
+- [ ] **Step 7: Validate (§7.4).**
+  - Two forced restarts of ob1m only give no `already exists` 400s for the new device. That is the live check that Synapse accepts an identical one-time-key re-upload.
   - The snapshot mtime advances after each restart.
   - A message from a MindRoom agent in an ob1m capture room is captured.
-  - Planting a lock dir with `touch -d '-5 min'` and restarting clears it, with a warn line.
-  - 24 hours later, there are zero `keys/upload` 400s for the new device.
+  - A planted lock directory with `touch -d '-5 min'` and no owner file, followed by a restart, is taken over with a warning.
+  - 24 hours later: zero `keys/upload` 400s for the new device.
 
 Ledger every result. ob1s (§7.5) is out of this plan until Sofia agrees.
 
-**Debug flags:** turning off `ob1_matrix_crypto_debug` and `ob1_matrix_timeline_debug` (§7.2) is an ob1 env change, which redeploys **both** tenants (`roles/ob1/tasks/main.yml:268-321`). It therefore waits until ob1s is off `:current`. That is a ruling against the spec's "turn off after §7.4", and it goes in the ledger.
+**Debug flags:** turning off `ob1_matrix_crypto_debug` and `ob1_matrix_timeline_debug` (§7.2) can now be done per tenant through the scoped role. Do it for ob1m after Step 7 passes.
