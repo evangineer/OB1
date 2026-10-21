@@ -176,6 +176,70 @@ test("wipe deletes nothing when the backup fails", () => {
   assert.ok(fs.existsSync(path.join(dir, "crypto-idb-snapshot.json")));
 });
 
+test("wipe removes a large nested tree and keeps only the lock inode", () => {
+  const dir = tmpDir();
+  const lock = path.join(dir, ".writer.lock");
+  fs.closeSync(fs.openSync(lock, "a"));
+  const inoBefore = fs.statSync(lock).ino;
+  // Many long-named top-level directories, each with nested content, so that
+  // `find -exec rm {} +` flushes several batches while it is still walking.
+  const pad = "d".repeat(200);
+  for (let i = 0; i < 1500; i++) {
+    const sub = path.join(dir, `${pad}-${i}`, "l1", "l2");
+    fs.mkdirSync(sub, { recursive: true });
+    fs.writeFileSync(path.join(sub, "f"), "x");
+    fs.writeFileSync(path.join(dir, `${pad}-${i}`, "g"), "x");
+  }
+  fs.writeFileSync(path.join(dir, ".hidden-file"), "x");
+  fs.mkdirSync(path.join(dir, ".hidden-dir", "inner"), { recursive: true });
+  fs.writeFileSync(path.join(dir, ".hidden-dir", "inner", "f"), "x");
+  const backup = path.join(tmpDir(), "backup.tgz");
+  const r = runSync("sh", [wipeStore, dir, backup], process.env);
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(fs.readdirSync(dir), [".writer.lock"]);
+  assert.equal(fs.statSync(lock).ino, inoBefore);
+  assert.ok(fs.statSync(backup).size > 0);
+});
+
+test("wipe refuses a backup path inside the directory", () => {
+  for (const rel of ["b.tgz", path.join("sub", "b.tgz"), path.join(".", "sub", "..", "b.tgz")]) {
+    const dir = tmpDir();
+    fs.closeSync(fs.openSync(path.join(dir, ".writer.lock"), "a"));
+    fs.writeFileSync(path.join(dir, "keep"), "x");
+    fs.mkdirSync(path.join(dir, "sub"));
+    fs.writeFileSync(path.join(dir, "sub", "keep2"), "x");
+    const before = fs.readdirSync(dir).sort();
+    const r = runSync("sh", [wipeStore, dir, path.join(dir, rel)], process.env);
+    assert.notEqual(r.status, 0, rel);
+    assert.match(r.stderr, /backup path .* is inside /, rel);
+    assert.deepEqual(fs.readdirSync(dir).sort(), before, rel);
+    assert.ok(fs.existsSync(path.join(dir, "sub", "keep2")), rel);
+    assert.ok(!fs.existsSync(path.join(dir, rel)), rel);
+  }
+});
+
+test("wipe refuses a backup path equal to the directory", () => {
+  const dir = tmpDir();
+  fs.writeFileSync(path.join(dir, "keep"), "x");
+  const r = runSync("sh", [wipeStore, dir, dir], process.env);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /is inside /);
+  assert.ok(fs.existsSync(path.join(dir, "keep")));
+});
+
+test("wipe accepts a sibling path that shares the directory prefix", () => {
+  const dir = tmpDir();
+  const sibling = `${dir}2`;
+  fs.mkdirSync(sibling);
+  fs.closeSync(fs.openSync(path.join(dir, ".writer.lock"), "a"));
+  fs.writeFileSync(path.join(dir, "x"), "x");
+  const backup = path.join(sibling, "b.tgz");
+  const r = runSync("sh", [wipeStore, dir, backup], process.env);
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(fs.readdirSync(dir), [".writer.lock"]);
+  assert.ok(fs.statSync(backup).size > 0);
+});
+
 test("legacy lock dir is removed with a warning", () => {
   const dir = tmpDir();
   const snap = path.join(dir, "crypto-idb-snapshot.json");
