@@ -1,6 +1,6 @@
 # Design: matrix-capture crypto-store integrity
 
-Status: approved 2026-10-21. Revised the same day after two Codex (GPT-6.1-Sol) reviews; changes are marked "Codex review #n" (first pass) or "Codex review 2, #n" (second pass). Implementation plan follows (superpowers:writing-plans); built test-first.
+Status: approved 2026-10-21. Revised the same day after three Codex (GPT-6.1-Sol) reviews; changes are marked "Codex review #n" (first pass), "Codex review 2, #n" (second) or "Codex review 3, #n" (focused check of the lock and role). Implementation plan follows (superpowers:writing-plans); built test-first.
 Nothing touches production until the rollout steps (§7), and each step there is operator-gated.
 
 The spec spans three repos:
@@ -88,10 +88,19 @@ The capture bot must **never operate on crypto state that differs from what the 
     - It works across containers on the same host sharing a local volume. That is our case: the stack is pinned to `dokploy-main-12bl5`.
     - `flock` is unreliable on network filesystems, which these volumes are not.
   - **If the lock is held:** the entrypoint prints `refusing to start: G4 another writer holds <path>` and exits 75.
-  - **Node checks it is running under the lock.** At startup, node runs `flock -n <path> true` in a child process. If the child *gets* the lock, nobody holds it, so the service wasn't started through the entrypoint: `refusing to start: G4 not running under the writer lock`.
+  - **Node proves it holds the lock (revised after Codex review 3, #1).** Contention alone proves nothing: a node started directly while the real bot runs would see the lock as held. So at startup node checks three things:
+    1. fd 9 is open;
+    2. `fstat(9)` has the same device and inode as `stat(<path>)`;
+    3. a child process given **fd 9 itself** (passed explicitly through `stdio`) succeeds at `flock -n 9`.
+
+    A lock attempt on the same open file description succeeds only if we hold the lock, or nobody does; in that second case the child's success leaves the lock held on our description. A lock held through any other description makes it fail.
+    - Any failure gives `refusing to start: G4 not running under the writer lock`.
+    - Node's own child processes don't inherit fd 9 (Node opens it close-on-exec), so the lock never outlives node.
   - **Legacy lock directories:** under the kernel lock, any `<snapshot>.lock/` directory (the 3 May ones) is stale by definition. It is removed with a warning.
   - Within the process, saves are serialised by an in-process mutex.
   - **Other writers take the same lock:** the reauth playbook wipes the volume only while holding it (§7.3).
+  - **The lock file is never deleted or replaced.** Deleting it would let a new process lock a new inode while the old holder still runs (Codex review 3, #2).
+  - **Persistent conflict:** with `restart_policy: on-failure`, a persistent conflict means a restart every 5 s, with the G4 message each time. That is loud and harmless, and the RUNBOOK says so.
 - **G5. Durable before publish.**
   - **Outgoing:** the crypto store snapshot must be on disk before any outgoing request that publishes or commits crypto state is sent: `/keys/upload`, `/keys/signatures/upload`, `/keys/device_signing/upload`, `sendToDevice`, and room-key backup uploads.
   - **Where to hook:** every one of these goes through `OutgoingRequestProcessor.prototype.makeOutgoingRequest` (`node_modules/matrix-js-sdk/lib/rust-crypto/OutgoingRequestProcessor.js:51-90`).
@@ -136,7 +145,13 @@ The capture bot must **never operate on crypto state that differs from what the 
     - The users list is filtered **first**, so room creation, the Matrix env files and the MCP env files all skip ob1s.
     - Services are mapped by tenant name rather than list position, with an assertion of exactly one service per managed tenant.
     - Change detection, redeploy webhooks, rollover checks and force-updates are all per tenant.
-    - A role run or a reauth follow-up can then never redeploy or rewrite ob1s.
+    - A `--tags ob1` role run or a reauth follow-up can then never redeploy or rewrite **ob1s's capture bot**.
+    - Services are matched with an anchored regex (`^ob1-<tenant>-.*_matrix-capture$`), and the old "exactly two services" assertion is removed.
+    - Accumulated facts (resolved users, room mappings, per-tenant flags) are reset at the start of each run.
+  - **Scope of the ob1s guarantee (Codex review 3, #3):** it covers ob1s's capture bot: its stack, env files, rooms, volume and Matrix device.
+    - Other roles (`supabase_ob1`, `openclaw`) still update ob1s's Supabase backend and MCP wiring on a full `site.yml` run, as they do today. That doesn't touch the capture bot's crypto.
+    - Every rollout command in this work uses `--tags ob1`.
+    - Isolating tenants across all roles is a separate piece of work.
   - **CI publication:** one workflow `concurrency` group per tag, and a registry error is a failure, not "tag absent".
   - **ob1s:** its stack file stays on `ob1-matrix-capture:current` until Sofia agrees. Nothing re-tags `:current`.
   - **Remove the on-node build from `dokploy-playbooks/roles/ob1`:** the source sync, `docker build` (`main.yml:97`) and the `docker service update --force` fan-out (`:373`). Do this only after ob1s has also moved off `:current`; until then those tasks are guarded off, so a role run can't rebuild or restart either tenant.
@@ -168,7 +183,7 @@ The capture bot must **never operate on crypto state that differs from what the 
 - **Tests:** no new dependencies. Use `node:test` via `npx tsx --test`, and add a `test` script to `package.json`.
 - **Deployment:** image `ob1-matrix-capture:current`, built on `dokploy-main-12bl5` by `dokploy-playbooks/roles/ob1`; stacks in `dokploy-stacks/ob1-ob1m`, `ob1-ob1s`.
 - Third-party attribution headers stay intact (`THIRD_PARTY_NOTICE.md`).
-- **Sofia's account:** nothing touches ob1s, its volume or her device without her consent.
+- **Sofia's account:** nothing touches ob1s's capture bot, its volume or her device without her consent (scope as in G8).
 
 ## 6. Tests required (written first, watched failing)
 
@@ -176,7 +191,8 @@ The capture bot must **never operate on crypto state that differs from what the 
 1. **Writer lock (two processes):**
    - With one process holding the lock through the entrypoint, a second start exits 75 with the G4 message.
    - After the first is SIGKILLed, a new start succeeds.
-   - Node started without the entrypoint refuses with `G4 not running under the writer lock`.
+   - Node started without the entrypoint refuses with `G4 not running under the writer lock`, **both** when nobody holds the lock **and** while another writer holds it.
+   - A reauth-style wipe under the lock leaves `.writer.lock` with the same inode, and a writer started during the wipe refuses.
    - A legacy `.lock/` directory is removed with a warning.
 2. **Atomic write:**
    - A simulated failure between the temp write and the rename leaves the old snapshot byte-identical.
@@ -227,7 +243,11 @@ Plus `npm run typecheck`, with `tsconfig.json` extended so the new modules and t
    - **Preflight:** confirm the vaulted password still logs in. If it fails, stop and come back.
      - The scratch session then uploads one one-time key twice with an identical body and expects 200 both times. This directly verifies that Synapse accepts an identical re-upload.
      - Then log out, which deletes the scratch device and its keys.
-   - **Stop barrier (Codex review 2, #5):** after scaling the service to 0, wait until its container has exited, and fail on timeout. Then back up and wipe the store from inside `flock -n` on `.writer.lock`, which proves no bot is running.
+   - **Stop barrier (Codex review 2, #5):** after scaling the service to 0, wait until its container has exited, and fail on timeout.
+   - **Then, holding `flock -n` on `.writer.lock`,** which proves no bot is running:
+     - back up the store;
+     - **only if the backup succeeded,** delete every entry in `/data/indexeddb` except `.writer.lock`, including hidden entries.
+     - The directory and the lock file stay in place (Codex review 3, #2).
    - Then verify the new device (RUNBOOK :1064-1112).
    - Then sign out `OB1M05`.
    - Change: the playbook's store wipe gets a backup step before `rm -rf`.

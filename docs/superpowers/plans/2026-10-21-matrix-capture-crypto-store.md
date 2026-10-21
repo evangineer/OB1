@@ -37,7 +37,11 @@
   - CI derives the tag as `<version>-<sha7>`, refuses existing tags, and uses one `concurrency` group per tag.
   - Stacks pin `tag@sha256:digest`.
   - The Dockerfile uses `npm ci` with `package-lock.json`, and starts through `entrypoint.sh`.
-- Nothing touches ob1s: not its stack, its env files, its rooms, its volume, or Sofia's device. `roles/ob1` acts only on `ob1_matrix_capture_managed_tenants: [ob1m]`. Pushes, deploys, applies and the rotation each need the operator's go-ahead.
+- **Nothing touches ob1s's capture bot:** not its stack, its env files, its rooms, its volume, or Sofia's device.
+  - `roles/ob1` acts only on `ob1_matrix_capture_managed_tenants: [ob1m]`, and every rollout command uses `--tags ob1`.
+  - A full `site.yml` run still updates ob1s's Supabase backend and MCP wiring through other roles, as today (spec G8 scope).
+- Pushes, deploys, applies and the rotation each need the operator's go-ahead.
+- `.writer.lock` is never deleted or replaced by anything.
 - `MATRIX_CRYPTO_DB_PREFIX` stays unwired, and is documented as inert.
 
 ## Review Focus
@@ -115,7 +119,8 @@
 ### Task 3: Kernel writer lock: `entrypoint.sh` and `writer-lock.ts` (G4)
 
 **Files:**
-- Create: `integrations/matrix-capture/entrypoint.sh`, `writer-lock.ts`, `writer-lock.test.ts`, `test-fixtures/hold-lock.ts`
+- Create: `integrations/matrix-capture/entrypoint.sh`, `writer-lock.ts`, `writer-lock.test.ts`, `test-fixtures/hold-lock.ts`, `test-fixtures/wipe-store.sh`
+  - `wipe-store.sh <dir> <backup.tgz>`: tar `<dir>` to the backup, and only if that succeeds, `find <dir> -mindepth 1 ! -name .writer.lock -exec rm -rf {} +`. It runs under BusyBox sh and POSIX sh.
 
 **Interfaces:**
 - **`entrypoint.sh`** (POSIX sh, `set -eu`):
@@ -123,10 +128,11 @@
   - `flock -n 9 || { echo "refusing to start: G4 another writer holds $dir/.writer.lock" >&2; exit 75; }`;
   - `exec "$@"`. The Dockerfile passes `node --import tsx service.ts`; tests pass a fixture.
 - `writer-lock.ts` produces:
-  - `assertRunningUnderWriterLock(lockPath: string, run?: (cmd: string, args: string[]) => { status: number | null }): void`
-    - Runs `flock -n <lockPath> true` as a child process.
-    - Exit status 0 means nobody holds the lock, so it throws `refusing to start: G4 not running under the writer lock`.
-    - Exit status 1 means held, which is OK.
+  - `assertRunningUnderWriterLock(lockPath: string, fd: number = 9): void` (Codex 3 #1):
+    1. **fd open:** `fstatSync(fd)` succeeds;
+    2. **same file:** its `dev` and `ino` equal `statSync(lockPath)`'s;
+    3. **we hold it:** `spawnSync("flock", ["-n", String(fd)], { stdio: [ "ignore", "ignore", "pipe", …(fd − 3) × "ignore", fd ] })` exits 0. That passes **our** fd to the child as the same number.
+    - A failure of 1 or 2, or exit 1 in 3, throws `refusing to start: G4 not running under the writer lock`.
     - Any other status, or `flock` missing, throws `refusing to start: G4 cannot check writer lock: <detail>`.
   - `removeLegacyLockDirs(snapshotPath: string, log: Pick<Console,"warn">): void`: removes `<snapshotPath>.lock/` when it is a directory, warning with `legacy snapshot lock` and its mtime.
 - **`test-fixtures/hold-lock.ts`:** calls `assertRunningUnderWriterLock`, prints `HELD`, then sleeps until killed.
@@ -136,7 +142,14 @@
     - spawn `sh entrypoint.sh node --import tsx test-fixtures/hold-lock.ts` with `MATRIX_INDEXEDDB_PATH=<tmp>` and wait for `HELD`;
     - spawn a second one → exit code 75, and stderr contains `refusing to start: G4 another writer holds`.
   - `lock is released when the holder is SIGKILLed`: kill the first with `SIGKILL`; a new start prints `HELD`.
-  - `node without the entrypoint refuses`: run `hold-lock.ts` directly → it throws `G4 not running under the writer lock`.
+  - `node without the entrypoint refuses when unlocked`: run `hold-lock.ts` directly with no holder → `G4 not running under the writer lock`.
+  - `node without the entrypoint refuses while another writer holds the lock` (Codex 3 #1): with the first holder running, run `hold-lock.ts` directly → `G4 not running under the writer lock`. **This test must fail against the contention-only probe.**
+  - `a wrong fd 9 refuses`: start node with fd 9 open on a different file (`sh -c 'exec 9>other; exec node …'`) → `G4 not running under the writer lock`.
+  - `a wipe under the lock keeps the lock inode` (Codex 3 #2):
+    - Hold `flock -n <dir>/.writer.lock` from a shell running the same wipe command as Task 9, which keeps `.writer.lock` and deletes all other entries.
+    - During the wipe, an entrypoint start exits 75.
+    - Afterwards, `.writer.lock` has the same inode, and the directory contains only `.writer.lock`.
+    - The wipe command lives in `test-fixtures/wipe-store.sh`, and Task 9 copies it verbatim.
   - `legacy lock dir is removed with a warning` (Review Focus 1): a `<snap>.lock/` directory, backdated to 2026-05-03, is gone afterwards, and a warn was logged.
 - [ ] **Step 2: Run them and watch them fail** (`npm test`; the files are missing).
 - [ ] **Step 3: Implement** `entrypoint.sh` (mode 0755) and `writer-lock.ts`.
@@ -323,17 +336,26 @@
 **Files** (in `~/src/dokploy-playbooks`, new branch `ob1-crypto-store` from `main`):
 - Modify: `group_vars/all/vars.yml`. Add `ob1_matrix_capture_managed_tenants: [ob1m]` and `ob1_matrix_capture_build_on_node: false`, with comments pointing at the spec.
 - Modify: `roles/ob1/tasks/main.yml` (Codex 2 #2):
+  - **Reset first** (Codex 3 #5): at the top of the role, reset `ob1_matrix_capture_users_resolved`, the room mappings and the per-tenant dicts to empty.
   - **Filter the users first.** Right after "Define OB1 Matrix capture users" (`:113`), filter `ob1_matrix_capture_users` to managed tenants. Everything downstream uses the filtered list: room alias resolution and creation (`:142-205`), the Matrix env files (`:207`) and the MCP env files (`:245`).
-  - **Map services by name.** Replace the positional `services[0]`/`[1]` (`:28-38`) with a lookup of each managed tenant's service by name pattern (`ob1-<tenant>-*_matrix-capture`). Assert exactly one match per managed tenant.
+  - **Map services by name.**
+    - Replace the positional `services[0]`/`[1]` (`:28-38`) with a per-tenant lookup using the anchored regex `^ob1-<tenant>-.*_matrix-capture$`.
+    - Assert exactly one match per managed tenant.
+    - Remove the "two services" assertion (`:22-26`).
+  - **Registered-result shapes** (Codex 3): env results are keyed by `result.item.key`; room-create results by `item.item.key`; webhook results by `item.key`. Use `default` / `selectattr('skipped','undefined')` before reading `status` or `stdout`.
   - **Per-tenant redeploys.** Change detection becomes a per-tenant dict built from the per-item results of both env tasks. Webhooks, rollover checks (`:268-370`) and force-updates (`:371`) loop over managed tenants and check that tenant's flag.
   - **Guard the on-node build.** Tasks `:40-102` and force-update get `when: ob1_matrix_capture_build_on_node | bool`.
 - Modify: `reauth-ob1-matrix.yml` (Codex 2 #5):
   - assert at the top that `tenant in ob1_matrix_capture_managed_tenants`;
   - after scaling the service to 0, wait (up to 90 s) until `docker ps -q -f name=<service>.` is empty, and fail on timeout;
-  - replace the wipe with one alpine `docker run`, executed under `flock -n /data/indexeddb/.writer.lock`: tar `/data/indexeddb` to `/backup/<tenant>-crypto-<ts>.tgz` (`/var/backups/ob1` mounted, directory 0700, file 0600), then clear and recreate the directory. A held lock fails the play.
+  - replace the `rm -rf && mkdir` wipe (`:115`) with one alpine `docker run`, which runs `flock -n /data/indexeddb/.writer.lock sh /wipe-store.sh /data/indexeddb /backup/<tenant>-crypto-<ts>.tgz`.
+    - `wipe-store.sh` is Task 3's fixture copied verbatim into `files/`, and mounted read-only.
+    - `/var/backups/ob1` is mounted (directory 0700); the archive is chmodded 0600 afterwards.
+    - A held lock or a failed backup fails the play. `.writer.lock` is never removed (Codex 3 #2).
 - Modify: `RUNBOOK.md`:
   - an incident note (3 May stale lock, found 2026-10-21);
-  - "Capture bot refuses to start", listing each message and its fix;
+  - "Capture bot refuses to start", listing each message and its fix, and noting that a persistent G4 conflict means a restart every 5 s;
+  - full `site.yml` runs still update ob1s's Supabase backend and MCP wiring; use `--tags ob1` for capture work;
   - the reauth section's backup step, lock and managed-tenants rule;
   - a pointer to the spec.
 
