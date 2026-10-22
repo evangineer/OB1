@@ -627,9 +627,10 @@ process.on("beforeExit", () => {
   process.exit(1);
 });
 
-// Until the real shutdown handlers are installed, a stop signal just exits: the startup gate is
-// still closed, so nothing has been published and there is nothing to save. Without this, node's
-// default action would kill the process silently, and a stalled startup step would hide the cause.
+// Until the real shutdown handlers are installed, a stop signal just exits without a final save.
+// That loses nothing: before the gate opens nothing is published, and after it opens (until the
+// handlers swap below) every publish is preceded by a save (G5). Without this, node's default
+// action would kill the process silently, and a stalled startup step would hide the cause.
 const startupSignalExit = (signal: NodeJS.Signals): void => {
   shuttingDown = true;
   console.error(`received ${signal} during startup; exiting`);
