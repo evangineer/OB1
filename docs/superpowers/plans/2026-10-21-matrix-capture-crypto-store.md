@@ -406,6 +406,7 @@ Every bullet that changes production needs the operator's go-ahead first.
   - **Identical re-upload test:** `POST /keys/upload` twice, with a byte-identical, well-formed body: `{"one_time_keys":{"signed_curve25519:AAAAAAAAAAA":{"key":"<base64>","signatures":{"<scratch user>":{"ed25519:<scratch device>":"<base64>"}}}}}`. Synapse doesn't verify one-time-key signatures. Expected: 200 both times.
     - **A 400 on the first POST** means the probe itself is malformed: fix it and retry. It says nothing about G5.
     - **Only a 400 on the second POST**, with `already exists`, means G5's crash-replay assumption is false. Stop.
+  - **G1 new-device check (ruling R22):** before the scratch session uploads anything, `POST /keys/query` with `{device_keys: {<user>: [<scratch device>]}}`. Expected: 200 with `device_keys` containing the user with an empty map (`{"<user>": {}}`). If the user is missing instead, stop: the new-device path would refuse with `G1 could not verify device keys: response missing user`, so G1 parsing needs adjusting before Step 6.
   - Log out. Expected: 200, and the scratch device and its keys are gone.
 - [ ] **Step 6: Rotate.** Run `ansible-playbook reauth-ob1-matrix.yml -e tenant=ob1m`.
   - Verify the new device (RUNBOOK :1064-1112).
